@@ -19,3 +19,13 @@ cargo run --release
 - Scroll Wheel: Zoom
 - T or Space: Toggle the CatmullRom Cinematic Tour
 - 1–7: Camera presets (1 Overview, 2 Grand Bridge, 3 Water Torii, 4 Waterfall Lake, 5 Senbon Torii, 6 Courtyard, 7 5-Tier Pagoda)
+
+## License
+
+- **Code** (Rust, WGSL, everything in this repo): MIT — see [LICENSE](LICENSE).
+- **Visuals**: there are no standalone visual assets here — every image is procedurally
+  generated at runtime from the code. The rendered output and the diorama's artistic
+  design (scene layout, color palettes, the shaders' visual content) are dedicated to
+  the public domain via [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/):
+  screenshots, recordings and derivative artwork are free to use for any purpose,
+  no attribution required.
