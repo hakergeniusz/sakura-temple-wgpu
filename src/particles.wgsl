@@ -2,7 +2,7 @@ struct SimParams {
     dt: f32,
     time: f32,
     count: u32,
-    _pad: u32,
+    paused: u32,
 };
 
 struct Petal {
@@ -16,23 +16,23 @@ struct Petal {
 @compute @workgroup_size(64)
 fn cs_petals(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= sim.count) { return; }
+    if (idx >= sim.count || sim.paused != 0u) { return; }
 
     var p = petals[idx];
     let phase = p.vel_col.z;
-    let wind_x = sin(sim.time * 0.45) * 0.65 + 0.85;
-    let wind_z = cos(sim.time * 0.35) * 0.45;
+    let wind_x = sin(sim.time * 0.42) * 0.55 + 0.75;
+    let wind_z = cos(sim.time * 0.35) * 0.42;
 
     p.pos_spin.y -= p.vel_col.x * sim.dt;
     p.pos_spin.x += (p.vel_col.y * wind_x + sin(sim.time * 2.0 + phase) * 0.65) * sim.dt;
     p.pos_spin.z += (wind_z + cos(sim.time * 1.7 + phase) * 0.55) * sim.dt;
     p.pos_spin.w += (1.2 + sin(phase) * 1.6) * sim.dt;
 
-    if (p.pos_spin.y < 3.0) { p.pos_spin.y = 74.0 + f32(idx % 9u); }
-    if (p.pos_spin.x > 122.0) { p.pos_spin.x -= 244.0; }
-    if (p.pos_spin.x < -122.0) { p.pos_spin.x += 244.0; }
-    if (p.pos_spin.z > 122.0) { p.pos_spin.z -= 244.0; }
-    if (p.pos_spin.z < -122.0) { p.pos_spin.z += 244.0; }
+    if (p.pos_spin.y < 8.0) { p.pos_spin.y = 74.0 + f32(idx % 9u); }
+    if (p.pos_spin.x > 200.0) { p.pos_spin.x -= 400.0; }
+    if (p.pos_spin.x < -200.0) { p.pos_spin.x += 400.0; }
+    if (p.pos_spin.z > 200.0) { p.pos_spin.z -= 400.0; }
+    if (p.pos_spin.z < -200.0) { p.pos_spin.z += 400.0; }
 
     petals[idx] = p;
 }
@@ -40,7 +40,8 @@ fn cs_petals(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Petal Render Shader
 struct CamUniform {
     view_proj: mat4x4<f32>,
-    cam_pos: vec4<f32>,
+    cam_pos: vec4<f32>,   // xyz = cam, w = fog_density
+    fog_col: vec4<f32>,   // rgb = linear fog, w = exposure
 };
 @group(0) @binding(0) var<uniform> cam: CamUniform;
 
@@ -68,6 +69,7 @@ fn vs_petal(in: PIn) -> POut {
     var col = vec3<f32>(1.0, 0.718, 0.773);
     if (ci == 1u) { col = vec3<f32>(1.0, 0.620, 0.710); }
     else if (ci == 2u) { col = vec3<f32>(1.0, 0.820, 0.863); }
+    else if (ci == 3u) { col = vec3<f32>(1.0, 0.753, 0.796); }
 
     var out: POut;
     out.clip = cam.view_proj * vec4<f32>(wpos, 1.0);
@@ -79,7 +81,9 @@ fn vs_petal(in: PIn) -> POut {
 @fragment
 fn fs_petal(in: POut) -> @location(0) vec4<f32> {
     let d = length(cam.cam_pos.xyz - in.world_pos);
-    let fog_f = 1.0 - exp(-pow(d * 0.0021, 2.0));
-    let fog_col = pow(vec3<f32>(0.910, 0.929, 0.949), vec3<f32>(2.2));
-    return vec4<f32>(mix(in.color, fog_col, clamp(fog_f, 0.0, 1.0)), 1.0);
+    let fog_f = 1.0 - exp(-pow(d * cam.cam_pos.w, 2.0));
+    let fogged = mix(in.color, cam.fog_col.rgb, clamp(fog_f, 0.0, 1.0));
+    let x = fogged * cam.fog_col.w;
+    let mapped = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+    return vec4<f32>(mapped, 1.0);
 }

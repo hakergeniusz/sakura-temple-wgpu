@@ -1,849 +1,1134 @@
-use bytemuck::{Pod, Zeroable};
+use glam::{Mat4, Vec3};
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
-pub const SX: usize = 240;
-pub const SY: usize = 96;
-pub const SZ: usize = 240;
-pub const HX: i32 = 120;
-pub const HZ: i32 = 120;
+use crate::builders::{
+    build_boat_archetypes, build_ceremonial_staircase, build_cliff_stilt_temple,
+    build_covered_bridge, build_golden_hall, build_grand_taiko_bridge, build_harbor_pier,
+    build_island_deck, build_nandaimon_gate, build_seven_tier_pagoda, build_unit_box_mesh,
+    build_villager_archetypes, build_watermill_house, compile_building_archetypes,
+    compile_tree_archetypes, build_bell_tower,
+};
+use crate::terrain::{is_water_body, make_senbon_curve, river_z, TerrainGrid, GRID_N};
+use crate::voxel::{
+    hex_to_linear_rgb, pal, CatmullRomCurve3, ColorCache, MeshData, ModelInstance, Rng,
+    VoxelVertex, MAT_CLOUD, MAT_LAMP, MAT_MIST,
+};
 
-pub const MAT_AIR: u8 = 0;
-pub const MAT_MATTE: u8 = 1;
-pub const MAT_WOOD: u8 = 2;
-pub const MAT_LEAVES: u8 = 3;
-pub const MAT_WATER: u8 = 4;
-pub const MAT_GOLD: u8 = 5;
-pub const MAT_WIN: u8 = 6;
-pub const MAT_LAMP: u8 = 7;
-
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-pub struct VoxelInstance {
-    pub pos_yaw: [f32; 4],
-    pub scale: [f32; 3],
-    pub packed: u32,
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TimeOfDay {
+    Day,
+    Sunset,
+    Night,
 }
 
-impl VoxelInstance {
-    pub fn pack(rgb: u32, mat: u8) -> u32 {
-        let r = (rgb >> 16) & 0xFF;
-        let g = (rgb >> 8) & 0xFF;
-        let b = rgb & 0xFF;
-        r | (g << 8) | (b << 16) | ((mat as u32) << 24)
-    }
-
-    pub fn new(x: f32, y: f32, z: f32, yaw: f32, sx: f32, sy: f32, sz: f32, rgb: u32, mat: u8) -> Self {
-        Self { pos_yaw: [x, y, z, yaw], scale: [sx, sy, sz], packed: Self::pack(rgb, mat) }
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-pub struct PetalGpu {
-    pub pos_spin: [f32; 4],
-    pub vel_col: [f32; 4],
-}
-
-pub struct VillagerAnim {
-    pub bx: f32, pub by: f32, pub bz: f32,
-    pub rot_y: f32, pub axis_x: bool, pub range: f32,
-    pub phase: f32, pub speed: f32, pub color_idx: usize,
-}
-
-pub struct BoatAnim {
-    pub x: f32, pub y: f32, pub z: f32, pub rot: f32, pub phase: f32,
-}
-
-pub struct CloudAnim {
-    pub x: f32, pub y: f32, pub z: f32, pub speed: f32,
-    pub offsets: Vec<[f32; 3]>,
-}
-
-pub struct WorldData {
-    pub opaque: Vec<VoxelInstance>,
-    pub shadow_opaque_count: u32, // Excludes underside bedrock from shadow pass
-    pub translucent_base: Vec<VoxelInstance>,
-    pub villagers: Vec<VillagerAnim>,
-    pub boats: Vec<BoatAnim>,
-    pub clouds: Vec<CloudAnim>,
-    pub petals: Vec<PetalGpu>,
-    pub point_lights: [[f32; 4]; 6],
-}
-
-struct Rng(u32);
-impl Rng {
-    fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_add(0x6D2B79F5);
-        let mut t = self.0;
-        t = (t ^ (t >> 15)).wrapping_mul(t | 1);
-        t ^= t.wrapping_add((t ^ (t >> 7)).wrapping_mul(t | 61));
-        ((t ^ (t >> 14)) as f32) / 4294967296.0
-    }
-}
-
-fn hash2(x: f32, z: f32) -> f32 {
-    let n = (x * 127.1 + z * 311.7).sin() * 43758.5453123;
-    n - n.floor()
-}
-fn noise2(x: f32, z: f32) -> f32 {
-    let ix = x.floor(); let iz = z.floor();
-    let fx = x - ix; let fz = z - iz;
-    let ux = fx * fx * (3.0 - 2.0 * fx);
-    let uz = fz * fz * (3.0 - 2.0 * fz);
-    let a = hash2(ix, iz); let b = hash2(ix + 1.0, iz);
-    let c = hash2(ix, iz + 1.0); let d = hash2(ix + 1.0, iz + 1.0);
-    a + (b - a) * ux + (c - a) * uz + (a - b - c + d) * ux * uz
-}
-fn fbm2(x: f32, z: f32, oct: i32) -> f32 {
-    let (mut v, mut a, mut f) = (0.0, 0.5, 1.0);
-    for _ in 0..oct { v += a * noise2(x * f, z * f); f *= 2.02; a *= 0.5; }
-    v
-}
-
-pub fn river_z(x: f32) -> f32 { 24.0 + 9.0 * (x * 0.032).sin() + 4.0 * (x * 0.065).cos() }
-pub fn river_hw(x: f32) -> f32 { 6.2 + 1.2 * (x * 0.09).sin() }
-pub fn is_lotus_lake(x: f32, z: f32) -> bool { ((x - 84.0) * 0.85).hypot((z - 25.0) * 1.1) < 15.5 }
-pub fn is_stream(x: f32, z: f32) -> bool { (x - (78.0 + 2.5 * (z * 0.1).sin())).abs() < 3.2 && z >= -14.0 && z <= 22.0 }
-pub fn is_water_body(x: i32, z: i32) -> bool {
-    let (fx, fz) = (x as f32, z as f32);
-    (fz - river_z(fx)).abs() <= river_hw(fx) || is_lotus_lake(fx, fz) || is_stream(fx, fz)
-}
-
-mod col {
-    pub const GRASS_1: u32 = 0x568c32;
-    pub const GRASS_2: u32 = 0x487529;
-    pub const GRASS_RICE: u32 = 0x67a63c;
-    pub const DIRT: u32 = 0x59483a;
-    pub const BEDROCK: u32 = 0x2c3034;
-    pub const STONE_DARK: u32 = 0x33363b;
-    pub const STONE_MID: u32 = 0x5c6063;
-    pub const COURTYARD: u32 = 0x8c9296;
-    pub const COURTYARD_ALT: u32 = 0x7d8388;
-    pub const COURTYARD_LT: u32 = 0x9ca2a6;
-    pub const MTN_BASE: u32 = 0x7a7d80;
-    pub const MTN_MID: u32 = 0x8f9396;
-    pub const MTN_DARK: u32 = 0x63676b;
-    pub const SNOW: u32 = 0xffffff;
-    pub const SNOW_SHADE: u32 = 0xedf2f7;
-    pub const SAND: u32 = 0x9e9785;
-    pub const WATER: u32 = 0x32a8a4;
-    pub const ROOF_DARK: u32 = 0x1e2024;
-    pub const ROOF_TRIM: u32 = 0x2c3036;
-    pub const CRIMSON: u32 = 0x9e2a2b;
-    pub const VERMILION: u32 = 0xb81d13;
-    pub const TORII_BASE: u32 = 0x1b1d21;
-    pub const PLASTER: u32 = 0xf4f1ea;
-    pub const PLASTER_W: u32 = 0xebe4d5;
-    pub const WOOD_WARM: u32 = 0xb5651d;
-    pub const WOOD_DARK: u32 = 0x3b281c;
-    pub const WOOD_BEAM: u32 = 0x6e3f1c;
-    pub const GOLD: u32 = 0xe6b800;
-    pub const WIN_GLOW: u32 = 0xfff3b0;
-    pub const LAMP_GLOW: u32 = 0xff7b00;
-    pub const SAKURA_1: u32 = 0xffb7c5;
-    pub const SAKURA_2: u32 = 0xff9eb5;
-    pub const SAKURA_3: u32 = 0xffd1dc;
-    pub const SAKURA_DEEP: u32 = 0xf08ba4;
-    pub const PINE: u32 = 0x2d6a1e;
-    pub const PINE_DARK: u32 = 0x225216;
-    pub const BAMBOO: u32 = 0x4d9430;
-    pub const BAMBOO_LEAF: u32 = 0x397d25;
-}
-
-struct Grid {
-    mat: Vec<u8>,
-    col: Vec<u32>,
-    sh: Vec<i32>,
-}
-
-impl Grid {
-    fn new() -> Self {
-        Self { mat: vec![0; SX * SY * SZ], col: vec![0; SX * SY * SZ], sh: vec![10; SX * SZ] }
-    }
-    #[inline]
-    fn idx(ix: usize, iy: usize, iz: usize) -> usize { (iy * SZ + iz) * SX + ix }
-    fn set(&mut self, wx: i32, wy: i32, wz: i32, m: u8, c: u32) {
-        let (ix, iy, iz) = (wx + HX, wy, wz + HZ);
-        if ix >= 0 && ix < SX as i32 && iy >= 0 && iy < SY as i32 && iz >= 0 && iz < SZ as i32 {
-            let i = Self::idx(ix as usize, iy as usize, iz as usize);
-            self.mat[i] = m;
-            self.col[i] = c;
+impl TimeOfDay {
+    pub fn name(self) -> &'static str {
+        match self {
+            TimeOfDay::Day => "Day",
+            TimeOfDay::Sunset => "Sunset",
+            TimeOfDay::Night => "Lantern Night",
         }
     }
-    fn get_mat(&self, ix: i32, iy: i32, iz: i32) -> u8 {
-        if ix < 0 || ix >= SX as i32 || iy < 0 || iy >= SY as i32 || iz < 0 || iz >= SZ as i32 { return 0; }
-        self.mat[Self::idx(ix as usize, iy as usize, iz as usize)]
-    }
-    fn fill(&mut self, x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32, m: u8, c: u32) {
-        for y in y0.min(y1)..=y0.max(y1) {
-            for z in z0.min(z1)..=z0.max(z1) {
-                for x in x0.min(x1)..=x0.max(x1) { self.set(x, y, z, m, c); }
-            }
+
+    pub fn next(self) -> Self {
+        match self {
+            TimeOfDay::Day => TimeOfDay::Sunset,
+            TimeOfDay::Sunset => TimeOfDay::Night,
+            TimeOfDay::Night => TimeOfDay::Day,
         }
     }
-    fn set_sh(&mut self, x: i32, z: i32, h: i32) {
-        let (ix, iz) = (x + HX, z + HZ);
-        if ix >= 0 && ix < SX as i32 && iz >= 0 && iz < SZ as i32 { self.sh[iz as usize * SX + ix as usize] = h; }
-    }
-    fn get_sh(&self, x: i32, z: i32) -> i32 {
-        let (ix, iz) = (x + HX, z + HZ);
-        if ix >= 0 && ix < SX as i32 && iz >= 0 && iz < SZ as i32 { self.sh[iz as usize * SX + ix as usize] } else { 10 }
+
+    pub fn params(self) -> TimeModeParams {
+        match self {
+            TimeOfDay::Day => TimeModeParams {
+                sky_top: hex_to_linear_rgb(0x8bbbe5),
+                sky_mid: hex_to_linear_rgb(0xd2e4f2),
+                sky_bot: hex_to_linear_rgb(0xdde7f0),
+                fog_col: hex_to_linear_rgb(0xdde7f0),
+                fog_d: 0.00135,
+                sun_col: hex_to_linear_rgb(0xfff6e5),
+                sun_int: 2.35,
+                sun_pos: Vec3::new(210.0, 260.0, 175.0),
+                hemi_sky: hex_to_linear_rgb(0xdff0ff),
+                hemi_gnd: hex_to_linear_rgb(0x6f8e58),
+                hemi_int: 0.92,
+                win_emissive: 0.55,
+                lamp_emissive: 1.05,
+                point_int: 8.0,
+                exposure: 1.05,
+            },
+            TimeOfDay::Sunset => TimeModeParams {
+                sky_top: hex_to_linear_rgb(0x3b4d7a),
+                sky_mid: hex_to_linear_rgb(0xd97d68),
+                sky_bot: hex_to_linear_rgb(0xf2b279),
+                fog_col: hex_to_linear_rgb(0xe3a87d),
+                fog_d: 0.00155,
+                sun_col: hex_to_linear_rgb(0xff9a52),
+                sun_int: 2.15,
+                sun_pos: Vec3::new(-240.0, 85.0, 160.0),
+                hemi_sky: hex_to_linear_rgb(0xffbfa0),
+                hemi_gnd: hex_to_linear_rgb(0x4c4452),
+                hemi_int: 0.75,
+                win_emissive: 1.15,
+                lamp_emissive: 1.85,
+                point_int: 22.0,
+                exposure: 1.02,
+            },
+            TimeOfDay::Night => TimeModeParams {
+                sky_top: hex_to_linear_rgb(0x070b14),
+                sky_mid: hex_to_linear_rgb(0x131d33),
+                sky_bot: hex_to_linear_rgb(0x1a263d),
+                fog_col: hex_to_linear_rgb(0x131c2e),
+                fog_d: 0.00175,
+                sun_col: hex_to_linear_rgb(0x8db0ff),
+                sun_int: 0.68,
+                sun_pos: Vec3::new(160.0, 230.0, -140.0),
+                hemi_sky: hex_to_linear_rgb(0x324770),
+                hemi_gnd: hex_to_linear_rgb(0x181c26),
+                hemi_int: 0.55,
+                win_emissive: 1.75,
+                lamp_emissive: 2.65,
+                point_int: 46.0,
+                exposure: 1.18,
+            },
+        }
     }
 }
 
-pub fn generate_world() -> WorldData {
-    let mut g = Grid::new();
-    let mut rng = Rng(20261113);
-
-    // 1. TERRAIN
-    let peaks = [
-        (-84f32, -92f32, 52f32, 34f32), (-44.0, -102.0, 60.0, 36.0),
-        (-4.0, -106.0, 64.0, 38.0), (42.0, -100.0, 58.0, 36.0),
-        (86.0, -90.0, 54.0, 34.0), (-105.0, -64.0, 42.0, 28.0),
-        (105.0, -62.0, 40.0, 28.0), (-94.0, -32.0, 24.0, 22.0),
-    ];
-
-    for z in -120..120 {
-        for x in -120i32..120 {
-            let (fx, fz) = (x as f32, z as f32);
-            let edge = (fx + 0.5).abs().max((fz + 0.5).abs());
-            let bot_y = if edge > 106.0 { (2.0 + (edge - 106.0) * 0.45).floor() as i32 } else { 1 };
-            let (rc, rw) = (river_z(fx), river_hw(fx));
-            let driv = (fz - rc).abs();
-            let in_lake = is_lotus_lake(fx, fz);
-            let in_stream = is_stream(fx, fz);
-            let wf = (x - 78).abs() <= 3 && z >= -66 && z <= -14;
-
-            let (mut top_y, mut is_plat, mut is_mtn, mut is_riv, mut is_rice) = (10, false, false, false, false);
-
-            if z <= -58 || (z <= -22 && x.abs() >= 70 && !wf) {
-                is_mtn = true;
-                let mut mh = 22.0f32;
-                for &(px, pz, ph, pr) in &peaks {
-                    let d = ((fx - px) * 0.92).hypot((fz - pz) * 1.1);
-                    if d < pr { mh = mh.max(22.0 + ph * (1.0 - d / pr).powf(1.32)); }
-                }
-                let crag = (fbm2(fx * 0.065 + 11.0, fz * 0.065 + 7.0, 3) - 0.35) * 18.0;
-                let ridge = (noise2(fx * 0.1, fz * 0.1) - 0.5).abs() * 12.0;
-                top_y = (mh + crag + ridge).max(20.0).round() as i32;
-                if z > -64 && x >= -68 && x <= 68 {
-                    let t = (fz + 64.0) / 6.0;
-                    top_y = ((top_y as f32) * (1.0 - t) + 24.0 * t).round() as i32;
-                }
-                if (fx + 86.0).hypot(fz + 44.0) < 12.0 { top_y = 28; }
-                if x >= -88 && x <= -74 && z >= -42 && z <= -10 {
-                    top_y = (12.0 + ((-10.0 - fz) / 32.0) * 16.0).round() as i32;
-                }
-            } else if z >= -60 && z <= -12 && x >= -68 && x <= 68 {
-                is_plat = true;
-                top_y = if z <= -34 && x.abs() <= 56 { 24 } else { 20 };
-            } else if x >= 72 && x <= 84 && z >= -66 && z <= -14 {
-                is_mtn = true;
-                top_y = (10.0 + ((-14.0 - fz) / 52.0) * 28.0).round() as i32;
-                if wf { top_y -= 2; }
-            } else if driv <= rw + 1.5 || in_lake || in_stream {
-                if driv <= rw || in_lake || in_stream {
-                    is_riv = true;
-                    top_y = if in_stream { 6 } else if in_lake || (1.0 - driv / rw) > 0.35 { 5 } else { 6 };
-                } else { top_y = 9; }
-            } else if x.abs() >= 68 && z >= -22 && fz < rc - rw - 1.0 {
-                let sx = (x.abs() as f32 - 68.0) / 52.0;
-                top_y = (10.0 + sx * 10.0 + fbm2(fx * 0.06, fz * 0.06, 2) * 3.0).round() as i32;
-            } else if x >= 74 && x <= 112 && z >= 54 && z <= 102 {
-                is_rice = true;
-                top_y = 10 + (x - 74) / 10;
-            } else {
-                top_y = 10 + if fbm2(fx * 0.04, fz * 0.04, 2) > 0.68 { 1 } else { 0 };
-                if x.abs() <= 22 && z >= -12 && z <= 112 { top_y = 10; }
-                if z >= 40 && z <= 102 && x.abs() <= 98 { top_y = 10; }
-                if z >= -10 && z <= 14 && x.abs() <= 72 { top_y = 10; }
-            }
-
-            g.set_sh(x, z, if is_riv { 8 } else { top_y });
-            for y in bot_y..=top_y {
-                let c = if (y <= bot_y + 1 && edge > 90.0) || (bot_y == 1 && y <= 2) {
-                    col::BEDROCK
-                } else if is_mtn {
-                    let snow_y = 48.0 + fbm2(fx * 0.08, fz * 0.08, 2) * 9.0;
-                    if (y as f32) >= snow_y && y >= top_y - 2 && !wf {
-                        if (x + z) % 3 == 0 { col::SNOW_SHADE } else { col::SNOW }
-                    } else if y == top_y && top_y <= 25 && !wf && rng.next_f32() < 0.32 {
-                        col::GRASS_2
-                    } else {
-                        let pk = hash2(fx * 1.7 + y as f32, fz * 1.3);
-                        if pk > 0.66 { col::MTN_MID } else if pk > 0.3 { col::MTN_BASE } else { col::MTN_DARK }
-                    }
-                } else if is_plat {
-                    if y == top_y {
-                        if x.abs() == 68 || z == -12 || z == -60 || (z == -34 && x.abs() <= 56) { col::STONE_MID }
-                        else if (x.abs() + z.abs()) % 5 == 0 { col::COURTYARD_ALT }
-                        else if (x * z) % 9 == 0 { col::COURTYARD_LT }
-                        else { col::COURTYARD }
-                    } else if y >= 12 {
-                        if (y + x + z) % 2 == 0 { col::STONE_MID } else { col::MTN_BASE }
-                    } else { col::MTN_DARK }
-                } else if is_riv {
-                    if y == top_y { col::SAND } else { col::MTN_DARK }
-                } else if is_rice {
-                    if y == top_y { if (x - 74) % 10 == 0 { col::DIRT } else { col::GRASS_RICE } } else { col::DIRT }
-                } else if y == top_y {
-                    if noise2(fx * 0.18, fz * 0.18) > 0.48 { col::GRASS_1 } else { col::GRASS_2 }
-                } else if y >= top_y - 2 {
-                    col::DIRT
-                } else if (x + y + z) % 3 == 0 { col::MTN_DARK } else { col::MTN_BASE };
-
-                g.set(x, y, z, MAT_MATTE, c);
-            }
-            if is_riv {
-                for y in (top_y + 1)..=8 { g.set(x, y, z, MAT_WATER, col::WATER); }
-            }
-            if wf && z >= -64 && z <= -14 {
-                for wy in (top_y + 1)..=(top_y + 3) { g.set(x, wy, z, MAT_WATER, col::WATER); }
-            }
-        }
-    }
-    for x in -68i32..=68 {
-        if x.abs() > 8 && (x.abs() - 46).abs() > 3 {
-            g.set(x, 21, -12, MAT_MATTE, if x % 2 == 0 { col::STONE_MID } else { col::STONE_DARK });
-        }
-    }
-    for z in -60..=-12 {
-        let c = if z % 2 == 0 { col::STONE_MID } else { col::STONE_DARK };
-        g.set(-68, 21, z, MAT_MATTE, c);
-        g.set(68, 21, z, MAT_MATTE, c);
-    }
-
-    // 2. PATHS, STAIRS & BRIDGES
-    fn cobble(g: &mut Grid, cx: i32, cz: i32, r: i32) {
-        for dz in -r..=r { for dx in -r..=r {
-            let (wx, wz) = (cx + dx, cz + dz);
-            if wx < -120 || wx >= 120 || wz < -120 || wz >= 120 || is_water_body(wx, wz) { continue; }
-            let h = g.get_sh(wx, wz);
-            g.set(wx, h, wz, MAT_MATTE, if (wx.abs() + wz.abs()) % 3 == 0 { 0x3e4248 } else { col::STONE_DARK });
-        }}
-    }
-    for z in 39..=112 { cobble(&mut g, 0, z, 3); }
-    for x in -14..=14 { for z in 62..=74 { cobble(&mut g, x, z, 0); } }
-    for x in -92..=68 { cobble(&mut g, x, 68, 2); }
-    for x in -80..=74 { cobble(&mut g, x, 48, 1); }
-    for &bx in &[-58, -32, 32, 60] { for z in 44..=96 { cobble(&mut g, bx, z, 1); } }
-    for z in 3..=16 { cobble(&mut g, 0, z, 3); }
-    for x in -76..=68 { cobble(&mut g, x, 6, 1); }
-    for z in 6..=21 { cobble(&mut g, 60, z, 1); }
-
-    fn stairs(g: &mut Grid, cx: i32, hw: i32, zb: i32, yb: i32, zt: i32, yt: i32) {
-        let steps = (zb - zt).abs();
-        let dz = if zt < zb { -1 } else { 1 };
-        for s in 0..=steps {
-            let z = zb + s * dz;
-            let y = (yb as f32 + (s as f32 / steps as f32) * (yt - yb) as f32).round() as i32;
-            for x in (cx - hw)..=(cx + hw) {
-                for fy in (yb - 1)..=y {
-                    g.set(x, fy, z, MAT_MATTE, if fy == y { if x % 2 == 0 { col::STONE_MID } else { 0x676b6f } } else { col::MTN_DARK });
-                }
-                g.set_sh(x, z, y);
-            }
-            for rx in [cx - hw - 1, cx + hw + 1] {
-                for fy in (yb - 1)..=(y + 1) { g.set(rx, fy, z, MAT_MATTE, col::STONE_DARK); }
-            }
-        }
-    }
-    stairs(&mut g, 0, 7, 2, 10, -12, 20);
-    stairs(&mut g, -46, 3, -1, 10, -12, 20);
-    stairs(&mut g, 46, 3, -1, 10, -12, 20);
-    stairs(&mut g, 0, 6, -26, 20, -34, 24);
-    stairs(&mut g, -36, 4, -26, 20, -34, 24);
-    stairs(&mut g, 30, 5, -26, 20, -34, 24);
-
-    for z in -33..=-13 { cobble(&mut g, 0, z, 2); }
-    for x in -46..=46 { for z in -23..=-21 { g.set(x, 20, z, MAT_MATTE, if (x + z) % 2 == 0 { col::STONE_DARK } else { 0x41454b }); } }
-    for z in -40..=-10 {
-        let y = g.get_sh(-80, z);
-        for x in -82..=-78 {
-            g.set(x, y, z, MAT_MATTE, col::STONE_MID);
-            for cy in (y + 1)..=(y + 9) { g.set(x, cy, z, MAT_AIR, 0); }
-        }
-    }
-
-    // Bridges
-    for z in 16..=40 {
-        let t = (z as f32 - 28.0) / 12.0;
-        let ay = (10.0 + 4.8 * (1.0 - t * t)).round() as i32;
-        for x in -4i32..=4 {
-            let edge = x.abs() == 4;
-            g.set(x, ay, z, MAT_WOOD, if edge { col::WOOD_BEAM } else { col::WOOD_WARM });
-            for cy in (ay + 1)..=(ay + 6) { g.set(x, cy, z, MAT_AIR, 0); }
-            if edge {
-                g.set(x, ay + 1, z, MAT_WOOD, col::VERMILION);
-                if (z - 16) % 4 == 0 { g.set(x, ay + 2, z, MAT_WOOD, col::VERMILION); }
-            }
-        }
-        if z == 21 || z == 28 || z == 35 { for px in [-4, 4] { for y in 5..ay { g.set(px, y, z, MAT_MATTE, col::STONE_DARK); } } }
-    }
-    for z in 20..=40 {
-        let t = (z as f32 - 30.0) / 10.0;
-        let ay = (10.0 + 3.2 * (1.0 - t * t)).round() as i32;
-        for x in 58..=62 {
-            let edge = x == 58 || x == 62;
-            g.set(x, ay, z, MAT_WOOD, if edge { col::WOOD_BEAM } else { col::WOOD_WARM });
-            for cy in (ay + 1)..=(ay + 5) { g.set(x, cy, z, MAT_AIR, 0); }
-            if edge {
-                g.set(x, ay + 1, z, MAT_WOOD, col::VERMILION);
-                if (z - 20) % 5 == 0 { g.set(x, ay + 2, z, MAT_WOOD, col::VERMILION); }
-            }
-        }
-        if z == 25 || z == 35 { for px in [58, 62] { for y in 5..ay { g.set(px, y, z, MAT_MATTE, col::STONE_DARK); } } }
-    }
-
-    // 3. TORII GATES
-    fn torii(g: &mut Grid, cx: i32, by: i32, cz: i32, axis_z: bool, hspan: i32, ph: i32) {
-        for s in [-hspan, hspan] {
-            let (wx, wz) = if axis_z { (cx + s, cz) } else { (cx, cz + s) };
-            for dy in 0..=1 { g.set(wx, by + dy, wz, MAT_MATTE, col::TORII_BASE); }
-            for dy in 2..=ph { g.set(wx, by + dy, wz, MAT_WOOD, col::VERMILION); }
-        }
-        let nuki = by + ph - 2;
-        for i in (-hspan - 1)..=(hspan + 1) {
-            let (wx, wz) = if axis_z { (cx + i, cz) } else { (cx, cz + i) };
-            g.set(wx, nuki, wz, MAT_WOOD, col::VERMILION);
-        }
-        g.set(cx, nuki + 1, cz, MAT_GOLD, col::GOLD);
-        let top = by + ph + 1;
-        for i in (-hspan - 2)..=(hspan + 2) {
-            let (wx, wz) = if axis_z { (cx + i, cz) } else { (cx, cz + i) };
-            if i.abs() != hspan + 2 {
-                g.set(wx, top - 1, wz, MAT_WOOD, col::VERMILION);
-                g.set(wx, top, wz, MAT_WOOD, col::ROOF_DARK);
-            } else {
-                g.set(wx, top, wz, MAT_WOOD, col::ROOF_DARK);
-                g.set(wx, top + 1, wz, MAT_WOOD, col::ROOF_DARK);
-            }
-        }
-    }
-    torii(&mut g, 0, 10, 92, true, 4, 10);
-    torii(&mut g, 0, 10, 54, true, 4, 9);
-    torii(&mut g, 0, 10, 9, true, 4, 9);
-    let wt_z = river_z(-48.0).round() as i32;
-    torii(&mut g, -48, 6, wt_z, true, 4, 11);
-    for s in [-4, 4] { g.fill(-48 + s - 1, 5, wt_z - 1, -48 + s + 1, 6, wt_z + 1, MAT_MATTE, col::STONE_MID); }
-    torii(&mut g, 84, 6, 26, false, 3, 9);
-    for s in [-3, 3] { g.fill(83, 5, 26 + s - 1, 85, 6, 26 + s + 1, MAT_MATTE, col::STONE_MID); }
-    for z in (-36..=-12).rev().step_by(3) { let sy = g.get_sh(-80, z); torii(&mut g, -80, sy, z, true, 2, 5); }
-
-    // 4. 5-TIERED PAGODA, MAIN TEMPLE, BELL TOWER & MOUNTAIN SHRINE
-    {
-        let (cx, cz, base_y) = (-36, -45, 25);
-        g.fill(cx - 8, base_y, cz - 8, cx + 8, base_y, cz + 8, MAT_MATTE, col::STONE_MID);
-        g.fill(cx - 3, base_y, cz + 9, cx + 3, base_y, cz + 9, MAT_MATTE, col::STONE_MID);
-        let tiers: [(i32, i32, i32); 5] = [(5, 9, 5), (4, 8, 4), (4, 7, 4), (3, 6, 4), (3, 5, 3)];
-        let mut cy = base_y + 1;
-        for (t, &(cr, er, h)) in tiers.iter().enumerate() {
-            if t > 0 {
-                for dx in (-cr - 1)..=(cr + 1) { for dz in (-cr - 1)..=(cr + 1) {
-                    if dx.abs() == cr + 1 || dz.abs() == cr + 1 { g.set(cx + dx, cy, cz + dz, MAT_WOOD, col::CRIMSON); }
-                }}
-            }
-            for dy in 0..h { for dx in -cr..=cr { for dz in -cr..=cr {
-                let (ex, ez) = (dx.abs() == cr, dz.abs() == cr);
-                if !ex && !ez { continue; }
-                let (m, c) = if ex && ez { (MAT_WOOD, col::WOOD_DARK) }
-                    else if dy == 1 && (dx == 0 || dz == 0 || dx.abs() == 2 || dz.abs() == 2) { (MAT_MATTE, col::PLASTER) }
-                    else if t == 0 && dz == cr && dx.abs() <= 1 && dy <= 2 { (MAT_WIN, col::WIN_GLOW) }
-                    else { (MAT_WOOD, col::CRIMSON) };
-                g.set(cx + dx, cy + dy, cz + dz, m, c);
-            }}}
-            let ry = cy + h;
-            for dx in (-cr - 1)..=(cr + 1) { for dz in (-cr - 1)..=(cr + 1) {
-                if dx.abs() > cr || dz.abs() > cr { g.set(cx + dx, ry, cz + dz, MAT_WOOD, col::WOOD_BEAM); }
-            }}
-            for dx in -er..=er { for dz in -er..=er {
-                if dx.abs() <= cr - 1 && dz.abs() <= cr - 1 { continue; }
-                g.set(cx + dx, ry + if dx.abs() == er && dz.abs() == er { 2 } else { 1 }, cz + dz, MAT_WOOD, col::ROOF_DARK);
-            }}
-            let mr = cr.max(er - 1);
-            for dx in -mr..=mr { for dz in -mr..=mr {
-                if dx.abs() == mr || dz.abs() == mr { g.set(cx + dx, ry + 2, cz + dz, MAT_WOOD, col::ROOF_TRIM); }
-            }}
-            cy += h + 2;
-        }
-        g.fill(cx - 2, cy, cz - 2, cx + 2, cy, cz + 2, MAT_WOOD, col::ROOF_DARK);
-        g.fill(cx - 1, cy + 1, cz - 1, cx + 1, cy + 2, cz + 1, MAT_WOOD, col::ROOF_DARK);
-        g.set(cx, cy + 3, cz, MAT_GOLD, col::GOLD);
-        for sy in 0..11 { g.set(cx, cy + 4 + sy, cz, MAT_GOLD, col::GOLD); }
-        for ry in [cy + 6, cy + 8, cy + 10, cy + 12] {
-            g.set(cx - 1, ry, cz, MAT_GOLD, col::GOLD); g.set(cx + 1, ry, cz, MAT_GOLD, col::GOLD);
-            g.set(cx, ry, cz - 1, MAT_GOLD, col::GOLD); g.set(cx, ry, cz + 1, MAT_GOLD, col::GOLD);
-        }
-    }
-
-    // Main Temple Complex
-    {
-        let (cx, cz, base_y) = (30, -45, 25);
-        g.fill(cx - 11, base_y, cz - 7, cx + 11, base_y, cz + 7, MAT_MATTE, col::STONE_MID);
-        g.fill(cx - 10, base_y + 1, cz - 6, cx + 10, base_y + 1, cz + 6, MAT_WOOD, col::WOOD_WARM);
-        g.fill(cx - 3, base_y, cz + 8, cx + 3, base_y, cz + 8, MAT_MATTE, col::COURTYARD);
-        let (wx, wz, wh) = (9i32, 5i32, 6i32);
-        for dy in 0..wh { for dx in -wx..=wx { for dz in -wz..=wz {
-            let (ex, ez) = (dx.abs() == wx, dz.abs() == wz);
-            if !ex && !ez { continue; }
-            let (mut m, mut c) = (MAT_MATTE, col::PLASTER);
-            if (ex && ez) || (ez && dx.abs() % 3 == 0) || (ex && dz.abs() % 2 == 1) { m = MAT_WOOD; c = col::CRIMSON; }
-            if dz == wz && dx.abs() <= 2 && dy <= 3 {
-                if dy == 0 || dx.abs() == 2 { m = MAT_WOOD; c = col::WOOD_BEAM; } else { m = MAT_WIN; c = col::WIN_GLOW; }
-            }
-            if ex && dz.abs() <= 2 && dy == 3 { m = MAT_WIN; c = col::WIN_GLOW; }
-            g.set(cx + dx, base_y + 2 + dy, cz + dz, m, c);
-        }}}
-        let ry = base_y + 2 + wh;
-        for layer in 0..=6 {
-            let (rx, rz) = (wx + 3 - layer, wz + 3 - layer);
-            if rz < 0 { break; }
-            for dx in -rx..=rx { for dz in -rz..=rz {
-                let corner = dx.abs() == rx && dz.abs() == rz;
-                let gable = layer >= 4 && dx.abs() == rx && dz.abs() < rz;
-                let (m, c) = if gable { (MAT_MATTE, col::PLASTER) }
-                    else if layer == 0 && corner { (MAT_GOLD, col::GOLD) }
-                    else { (MAT_WOOD, if layer % 2 == 0 { col::ROOF_DARK } else { col::ROOF_TRIM }) };
-                g.set(cx + dx, ry + layer + if layer == 0 && corner { 1 } else { 0 }, cz + dz, m, c);
-            }}
-        }
-        for dx in -7i32..=7 {
-            let end = dx.abs() >= 6;
-            g.set(cx + dx, ry + 7, cz, if end { MAT_GOLD } else { MAT_WOOD }, if end { col::GOLD } else { col::ROOF_DARK });
-            if dx.abs() == 7 { g.set(cx + dx, ry + 8, cz, MAT_GOLD, col::GOLD); }
-        }
-        for wwx in [16, 44] {
-            for z in -34..=-16 {
-                g.set(wwx, 21, z, MAT_MATTE, col::STONE_MID);
-                if z % 3 == 0 { for dy in 1..=3 { g.set(wwx, 21 + dy, z, MAT_WOOD, col::CRIMSON); } }
-                for dx in -1..=1 { g.set(wwx + dx, 25, z, MAT_WOOD, col::ROOF_DARK); }
-                g.set(wwx, 26, z, MAT_WOOD, col::ROOF_TRIM);
-            }
-        }
-        for x in 16..=44 {
-            if (x - cx).abs() > 3 {
-                g.set(x, 21, -16, MAT_MATTE, col::STONE_MID);
-                g.set(x, 22, -16, MAT_MATTE, col::PLASTER);
-                g.set(x, 23, -16, MAT_MATTE, col::PLASTER);
-                g.set(x, 24, -16, MAT_WOOD, col::ROOF_DARK);
-            } else {
-                if (x - cx).abs() == 3 { for dy in 0..=4 { g.set(x, 21 + dy, -16, MAT_WOOD, col::CRIMSON); } }
-                for dz in -1..=1 { g.set(x, 25, -16 + dz, MAT_WOOD, col::ROOF_DARK); }
-                g.set(x, 26, -16, MAT_GOLD, if (x - cx).abs() == 3 { col::GOLD } else { col::ROOF_DARK });
-            }
-        }
-        g.fill(cx - 1, 21, -24, cx + 1, 21, -22, MAT_MATTE, col::STONE_MID);
-        g.set(cx, 22, -23, MAT_MATTE, col::STONE_DARK);
-        g.set(cx, 23, -23, MAT_LAMP, col::LAMP_GLOW);
-    }
-
-    // Bell Tower (Shoro)
-    {
-        let (bx, bz, by) = (0, -46, 25);
-        g.fill(bx - 3, by, bz - 3, bx + 3, by, bz + 3, MAT_MATTE, col::STONE_MID);
-        for px in [-2, 2] { for pz in [-2, 2] { for dy in 1..=4 { g.set(bx + px, by + dy, bz + pz, MAT_WOOD, col::CRIMSON); } } }
-        g.fill(bx - 1, by + 2, bz - 1, bx + 1, by + 3, bz + 1, MAT_GOLD, col::GOLD);
-        for l in 0..=3 {
-            let r = 4 - l;
-            for dx in -r..=r { for dz in -r..=r { g.set(bx + dx, by + 5 + l, bz + dz, MAT_WOOD, if l == 3 { col::ROOF_TRIM } else { col::ROOF_DARK }); } }
-        }
-        g.set(bx, by + 9, bz, MAT_GOLD, col::GOLD);
-    }
-
-    // 5. VILLAGE HOUSES & MOUNTAIN SHRINE
-    fn build_house(g: &mut Grid, cx: i32, by: i32, cz: i32, hw: i32, hd: i32, wh: i32, ax_z: bool, inn: bool) {
-        g.fill(cx - hw, by, cz - hd, cx + hw, by, cz + hd, MAT_MATTE, col::STONE_MID);
-        for dy in 1..=wh { for dx in -hw..=hw { for dz in -hd..=hd {
-            let (ox, oz) = (dx.abs() == hw, dz.abs() == hd);
-            if !ox && !oz { continue; }
-            let (mut m, mut c) = (if dy == 1 { MAT_WOOD } else { MAT_MATTE }, if dy == 1 { col::WOOD_BEAM } else { col::PLASTER_W });
-            if ox && oz { m = MAT_WOOD; c = if inn { col::CRIMSON } else { col::WOOD_DARK }; }
-            else if (dy == 2 || dy == 4) && ((oz && dx.abs() <= hw - 1 && dx % 2 == 0) || (ox && dz.abs() <= hd - 1 && dz % 2 == 0)) {
-                m = MAT_WIN; c = col::WIN_GLOW;
-            }
-            g.set(cx + dx, by + dy, cz + dz, m, c);
-        }}}
-        let rs = by + wh + 1;
-        let span = if ax_z { hd + 1 } else { hw + 1 };
-        for l in 0..=span {
-            if ax_z {
-                let rz = hd + 1 - l;
-                for dx in (-hw - 1)..=(hw + 1) { for dz in -rz..=rz {
-                    if dz.abs() == rz || l == span { g.set(cx + dx, rs + l, cz + dz, MAT_WOOD, if l == span { col::ROOF_TRIM } else { col::ROOF_DARK }); }
-                    else if dx.abs() == hw { g.set(cx + dx, rs + l, cz + dz, MAT_MATTE, col::PLASTER_W); }
-                }}
-            } else {
-                let rx = hw + 1 - l;
-                for dz in (-hd - 1)..=(hd + 1) { for dx in -rx..=rx {
-                    if dx.abs() == rx || l == span { g.set(cx + dx, rs + l, cz + dz, MAT_WOOD, if l == span { col::ROOF_TRIM } else { col::ROOF_DARK }); }
-                    else if dz.abs() == hd { g.set(cx + dx, rs + l, cz + dz, MAT_MATTE, col::PLASTER_W); }
-                }}
-            }
-        }
-    }
-    build_house(&mut g, -85, 28, -45, 4, 3, 3, true, true);
-    let houses = [
-        (-19,60,5,4,5,false,true),(19,60,5,4,5,false,true),(-19,76,4,4,4,true,false),(19,76,4,4,4,true,false),
-        (-14,92,4,3,3,true,false),(14,92,4,3,3,true,false),(-38,56,4,3,3,true,false),(-54,56,5,4,4,false,false),
-        (-72,58,4,3,3,true,false),(-38,76,4,4,3,false,false),(-54,78,4,3,4,true,false),(-74,78,5,3,3,true,false),
-        (-42,94,4,3,3,true,false),(-62,94,4,4,3,false,false),(-84,90,4,3,3,false,false),(38,56,4,3,3,true,false),
-        (54,56,5,4,4,false,false),(38,76,4,4,3,false,false),(54,78,4,3,4,true,false),(40,94,4,3,3,true,false),
-        (60,94,5,3,3,true,false),(24,0,4,3,3,true,false),(48,0,4,3,3,false,true),(74,2,4,3,3,true,false),(-28,0,4,3,3,true,false),
-    ];
-    for &(x, z, hw, hd, h, ax, inn) in &houses { let sy = g.get_sh(x, z); build_house(&mut g, x, sy, z, hw, hd, h, ax, inn); }
-
-    // 6. FLORA & LANTERNS
-    fn sakura_tree(g: &mut Grid, rng: &mut Rng, x: i32, by: i32, z: i32, sc: f32) {
-        let th = ((4.5 + rng.next_f32() * 2.5) * sc).round() as i32;
-        let (mut tx, mut tz) = (x, z);
-        for dy in 1..=th {
-            g.set(tx, by + dy, tz, MAT_WOOD, col::WOOD_DARK);
-            if sc >= 1.1 && dy <= 2 { g.set(tx + 1, by + dy, tz, MAT_WOOD, col::WOOD_DARK); }
-            if dy == 2 && rng.next_f32() < 0.6 { tx += if rng.next_f32() < 0.5 { 1 } else { -1 }; }
-            if dy == 3 && rng.next_f32() < 0.6 { tz += if rng.next_f32() < 0.5 { 1 } else { -1 }; }
-        }
-        let cy = by + th;
-        let rad = (3.6 * sc).round() as i32;
-        fn blob(g: &mut Grid, rng: &mut Rng, cx: i32, ccy: i32, cz: i32, rx: i32, ry: i32, rz: i32) {
-            for dy in -ry..=ry { for dz in -rz..=rz { for dx in -rx..=rx {
-                let n = (dx * dx) as f32 / (rx * rx) as f32 + (dy * dy) as f32 / (ry * ry) as f32 + (dz * dz) as f32 / (rz * rz) as f32;
-                if n <= 1.05 && !(n > 0.82 && rng.next_f32() < 0.35) {
-                    let r = rng.next_f32();
-                    let c = if dy < 0 && r < 0.45 { col::SAKURA_DEEP } else if r < 0.34 { col::SAKURA_2 } else if r > 0.72 { col::SAKURA_3 } else { col::SAKURA_1 };
-                    g.set(cx + dx, ccy + dy, cz + dz, MAT_LEAVES, c);
-                }
-            }}}
-        }
-        blob(g, rng, tx, cy + 1, tz, rad + 1, 1, rad + 1);
-        let br = 3 + (rng.next_f32() * 2.0) as i32;
-        for b in 0..br {
-            let ang = (b as f32 / br as f32) * std::f32::consts::TAU + rng.next_f32() * 0.8;
-            let bx = tx + (ang.cos() * 2.4 * sc).round() as i32;
-            let bz = tz + (ang.sin() * 2.4 * sc).round() as i32;
-            g.set((tx + bx) / 2, cy, (tz + bz) / 2, MAT_WOOD, col::WOOD_DARK);
-            let by_off = if rng.next_f32() < 0.5 { 0 } else { 1 };
-            blob(g, rng, bx, cy + by_off, bz, (rad - 1).max(2), 1, (rad - 1).max(2));
-        }
-    }
-    let hero_sakura = [
-        (-10,104,1.2),(10,104,1.2),(-10,84,1.1),(10,84,1.1),(-10,46,1.15),(10,46,1.15),
-        (-14,14,1.15),(14,14,1.15),(-32,40,1.2),(32,42,1.2),(-64,42,1.15),(68,42,1.2),
-        (-58,-20,1.2),(58,-20,1.2),(-56,-52,1.1),(56,-52,1.1),(-16,-30,1.05),(12,-30,1.05),
-        (24,-24,0.8),(36,-24,0.8),(96,8,1.2),(98,40,1.15),(-96,30,1.2),(-96,60,1.15),
-    ];
-    for &(sx, sz, sc) in &hero_sakura { if !is_water_body(sx, sz) { let sy = g.get_sh(sx, sz); sakura_tree(&mut g, &mut rng, sx, sy, sz, sc); } }
-    for _ in 0..65 {
-        let sx = ((rng.next_f32() - 0.5) * 204.0).round() as i32;
-        let sz = (-54.0 + rng.next_f32() * 160.0).round() as i32;
-        if is_water_body(sx, sz) || (sx.abs() < 12 && sz > -15) { continue; }
-        if (sx >= -52 && sx <= 50 && sz >= -58 && sz <= -14) || (sx >= 72 && sx <= 114 && sz >= 52 && sz <= 104) || (sx < -68 && sz < 20) { continue; }
-        let h = g.get_sh(sx, sz);
-        if h <= 26 { let sc = 0.9 + rng.next_f32() * 0.35; sakura_tree(&mut g, &mut rng, sx, h, sz, sc); }
-    }
-
-    fn pine(g: &mut Grid, rng: &mut Rng, x: i32, by: i32, z: i32) {
-        let h = 8 + (rng.next_f32() * 5.0) as i32;
-        for dy in 1..=(h - 2) { g.set(x, by + dy, z, MAT_WOOD, col::WOOD_DARK); }
-        for ly in 3..=(h + 1) {
-            let r = (((h + 1 - ly) as f32) * 0.48).round().max(0.0) as i32;
-            for dx in -r..=r { for dz in -r..=r {
-                if dx.abs() + dz.abs() <= r + if (ly - 3) % 2 == 1 { 0 } else { 1 } {
-                    g.set(x + dx, by + ly, z + dz, MAT_LEAVES, if rng.next_f32() < 0.35 { col::PINE_DARK } else { col::PINE });
-                }
-            }}
-        }
-    }
-    fn bamboo(g: &mut Grid, rng: &mut Rng, x: i32, by: i32, z: i32) {
-        let h = 8 + (rng.next_f32() * 7.0) as i32;
-        for dy in 1..=h {
-            g.set(x, by + dy, z, MAT_WOOD, if dy % 3 == 0 { col::PINE } else { col::BAMBOO });
-            if dy >= h - 2 {
-                for [ox, oz] in [[1,0],[-1,0],[0,1],[0,-1]] {
-                    if rng.next_f32() < 0.55 { g.set(x + ox, by + dy, z + oz, MAT_LEAVES, col::BAMBOO_LEAF); }
-                }
-            }
-        }
-    }
-    for z in (-56..=20).step_by(5) { for x in (-114..=-70).step_by(5) {
-        let (px, pz) = (x + (rng.next_f32() * 3.0) as i32 - 1, z + (rng.next_f32() * 3.0) as i32 - 1);
-        if is_water_body(px, pz) || (px >= -88 && px <= -74 && pz <= -8 && pz >= -50) { continue; }
-        if rng.next_f32() < 0.55 { let py = g.get_sh(px, pz); pine(&mut g, &mut rng, px, py, pz); }
-        else {
-            let py = g.get_sh(px, pz);
-            bamboo(&mut g, &mut rng, px, py, pz);
-            if rng.next_f32() < 0.7 { let py2 = g.get_sh(px + 1, pz); bamboo(&mut g, &mut rng, px + 1, py2, pz); }
-        }
-    }}
-    for z in (-54..=10).step_by(6) { for x in (86..=114).step_by(6) { if !is_water_body(x, z) { let py = g.get_sh(x, z); pine(&mut g, &mut rng, x, py, z); } } }
-
-    let lamps = [
-        (-6,102,2),(6,102,2),(-6,84,2),(6,84,2),(-10,68,2),(10,68,2),(-6,50,2),(6,50,2),
-        (-6,41,2),(6,41,2),(-6,15,2),(6,15,2),(-8,3,1),(8,3,1),(-8,-11,1),(8,-11,1),
-        (-24,-22,2),(24,-22,2),(-36,-36,2),(22,-36,2),(38,-36,2),(-40,68,2),(40,68,2),(60,18,2),(60,42,2),
-    ];
-    for &(lx, lz, t) in &lamps {
-        let by = g.get_sh(lx, lz);
-        g.set(lx, by + 1, lz, MAT_MATTE, col::STONE_DARK);
-        if t >= 2 { g.set(lx, by + 2, lz, MAT_MATTE, col::STONE_MID); }
-        g.set(lx, by + t + 1, lz, MAT_LAMP, col::LAMP_GLOW);
-        g.set(lx, by + t + 2, lz, MAT_WOOD, col::ROOF_DARK);
-    }
-    g.set(-4, 18, 28, MAT_LAMP, col::LAMP_GLOW);
-    g.set(4, 18, 28, MAT_LAMP, col::LAMP_GLOW);
-
-    // 7. SURFACE-CULLED INSTANCE EXTRACTION
-    let mut shadow_opaque = Vec::new();
-    let mut noshadow_opaque = Vec::new();
-    let mut translucent_base = Vec::new();
-    let dirs = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
-
-    for iy in 0..SY as i32 { for iz in 0..SZ as i32 { for ix in 0..SX as i32 {
-        let i = Grid::idx(ix as usize, iy as usize, iz as usize);
-        let m = g.mat[i];
-        if m == MAT_AIR { continue; }
-        let mut vis = false;
-        if m == MAT_WATER {
-            if g.get_mat(ix, iy + 1, iz) == MAT_AIR || ix == 0 || ix == SX as i32 - 1 || iz == 0 || iz == SZ as i32 - 1 { vis = true; }
-        } else {
-            for d in dirs {
-                let nm = g.get_mat(ix + d[0], iy + d[1], iz + d[2]);
-                if nm == MAT_AIR || nm == MAT_WATER { vis = true; break; }
-            }
-        }
-        if !vis { continue; }
-        let (wx, wy, wz, c) = ((ix - HX) as f32, iy as f32, (iz - HZ) as f32, g.col[i]);
-        if m == MAT_WATER {
-            translucent_base.push(VoxelInstance::new(wx, wy - 0.075, wz, 0.0, 1.0, 0.85, 1.0, c, m));
-        } else if c == col::BEDROCK {
-            noshadow_opaque.push(VoxelInstance::new(wx, wy, wz, 0.0, 1.0, 1.0, 1.0, c, m));
-        } else {
-            shadow_opaque.push(VoxelInstance::new(wx, wy, wz, 0.0, 1.0, 1.0, 1.0, c, m));
-        }
-    }}}
-
-    // Static Lily Pads + Lotus Flowers
-    let mut pad_count = 0usize;
-    for x in (-112i32..=112).step_by(3) {
-        if x.abs() < 7 || (x - 60).abs() < 5 || (x + 48).abs() < 7 { continue; }
-        if rng.next_f32() < 0.6 {
-            let px = x as f32 + (rng.next_f32() - 0.5) * 1.4;
-            let pz = river_z(x as f32) + (rng.next_f32() - 0.5) * (river_hw(x as f32) - 1.2) * 1.4;
-            let rot = rng.next_f32() * std::f32::consts::PI;
-            shadow_opaque.push(VoxelInstance::new(px, 8.38, pz, rot, 0.88, 0.1, 0.88, 0x459e32, MAT_LEAVES));
-            if pad_count % 3 == 0 {
-                shadow_opaque.push(VoxelInstance::new(px, 8.48, pz, rot, 0.3, 0.16, 0.3, col::SAKURA_1, MAT_LEAVES));
-            }
-            pad_count += 1;
-        }
-    }
-
-    let shadow_opaque_count = shadow_opaque.len() as u32;
-    let mut opaque = shadow_opaque;
-    opaque.extend(noshadow_opaque);
-
-    // 8. DYNAMIC ENTITIES (BOATS, VILLAGERS, CLOUDS, GPU PETALS)
-    let boats = vec![
-        (-80.0, river_z(-80.0), 0.25), (-24.0, river_z(-24.0), -0.3), (24.0, river_z(24.0) + 1.0, 0.2),
-        (44.0, river_z(44.0) - 1.0, -0.15), (76.0, 28.0, 0.6), (92.0, 22.0, -0.5),
-    ].into_iter().map(|(x, z, rot)| BoatAnim { x, y: 8.35, z, rot, phase: rng.next_f32() * 6.28 }).collect();
-
-    let mut villagers = Vec::new();
-    fn add_v(villagers: &mut Vec<VillagerAnim>, rng: &mut Rng, bx: f32, by: f32, bz: f32, ci: usize, rot_y: f32, axis_x: bool, range: f32) {
-        villagers.push(VillagerAnim {
-            bx, by, bz, rot_y, axis_x, range,
-            phase: rng.next_f32() * 6.28, speed: 0.55 + rng.next_f32() * 0.35, color_idx: ci,
-        });
-    }
-    add_v(&mut villagers, &mut rng, -1.5, 15.5, 28.0, 0, 1.8, false, 2.8);
-    add_v(&mut villagers, &mut rng, 1.6, 15.5, 26.0, 1, -1.2, false, 0.0);
-    add_v(&mut villagers, &mut rng, 0.2, 15.5, 30.5, 2, 0.2, false, 0.0);
-    add_v(&mut villagers, &mut rng, 60.0, 13.5, 30.0, 1, 0.0, false, 2.5);
-    for &(vx, vz, ci, ax, rg) in &[
-        (-4,68,0,true,5.0),(6,65,1,false,4.0),(-8,72,2,true,0.0),(10,70,0,true,0.0),
-        (-2,98,1,false,5.0),(2,82,2,false,4.0),(-2,46,0,false,4.0),(-36,68,1,true,6.0),
-        (-60,68,2,true,5.0),(34,68,0,true,6.0),(56,68,1,true,5.0),(-46,48,2,true,0.0),
-        (44,48,0,true,0.0),(70,6,1,true,0.0),(22,6,2,true,4.0),(-24,6,0,true,4.0),
-        (-6,-22,2,true,6.0),(10,-22,0,true,5.0),(-28,-22,1,true,4.0),(-30,-34,0,true,0.0),
-        (28,-22,2,true,0.0),(32,-32,1,true,0.0),(-4,-42,0,true,0.0),
-    ] {
-        let rot = rng.next_f32() * 6.28;
-        let gy = g.get_sh(vx, vz);
-        add_v(&mut villagers, &mut rng, vx as f32, gy as f32 + 0.5, vz as f32, ci, rot, ax, rg);
-    }
-
-    let mut clouds = Vec::new();
-    for _ in 0..22 {
-        let mut offsets = Vec::new();
-        let (lx, lz) = (3 + (rng.next_f32() * 5.0) as i32, 2 + (rng.next_f32() * 4.0) as i32);
-        for dx in -lx..=lx { for dz in -lz..=lz {
-            let d = (dx * dx) as f32 / (lx * lx) as f32 + (dz * dz) as f32 / (lz * lz) as f32;
-            if d <= 1.05 {
-                offsets.push([dx as f32 * 3.1, 0.0, dz as f32 * 3.1]);
-                if d < 0.45 && rng.next_f32() < 0.75 { offsets.push([dx as f32 * 3.1, 1.9, dz as f32 * 3.1]); }
-            }
-        }}
-        clouds.push(CloudAnim {
-            x: (rng.next_f32() - 0.5) * 340.0, y: 82.0 + rng.next_f32() * 20.0, z: (rng.next_f32() - 0.5) * 300.0,
-            speed: 1.5 + rng.next_f32() * 1.4, offsets,
-        });
-    }
-
-    let petals = (0..4096).map(|i| PetalGpu {
-        pos_spin: [(rng.next_f32() - 0.5) * 244.0, 6.0 + rng.next_f32() * 72.0, (rng.next_f32() - 0.5) * 244.0, rng.next_f32() * 6.28],
-        vel_col: [1.4 + rng.next_f32() * 1.5, 0.8 + rng.next_f32() * 0.9, rng.next_f32() * 6.28, (i % 3) as f32],
-    }).collect();
-
-    let point_lights = [
-        [0.0, 14.0, 92.0, 28.0], [0.0, 14.0, 54.0, 28.0], [0.0, 19.0, 28.0, 28.0],
-        [0.0, 22.0, -10.0, 28.0], [30.0, 24.0, -23.0, 28.0], [-36.0, 27.0, -36.0, 28.0],
-    ];
-
-    WorldData { opaque, shadow_opaque_count, translucent_base, villagers, boats, clouds, petals, point_lights }
+pub struct TimeModeParams {
+    pub sky_top: [f32; 3],
+    pub sky_mid: [f32; 3],
+    pub sky_bot: [f32; 3],
+    pub fog_col: [f32; 3],
+    pub fog_d: f32,
+    pub sun_col: [f32; 3],
+    pub sun_int: f32,
+    pub sun_pos: Vec3,
+    pub hemi_sky: [f32; 3],
+    pub hemi_gnd: [f32; 3],
+    pub hemi_int: f32,
+    pub win_emissive: f32,
+    pub lamp_emissive: f32,
+    pub point_int: f32,
+    pub exposure: f32,
 }
 
-pub fn build_dynamic_instances(world: &mut WorldData, t: f32, dt: f32, dyn_opaque: &mut Vec<VoxelInstance>, dyn_trans: &mut Vec<VoxelInstance>) {
-    dyn_opaque.clear();
-    dyn_trans.clear();
+pub const NIGHT_LIGHTS: [[f32; 4]; 12] = [
+    [0.0, 14.0, 174.0, 48.0],
+    [0.0, 14.0, 118.0, 48.0],
+    [0.0, 14.0, 82.0, 48.0],
+    [0.0, 18.0, 44.0, 48.0],
+    [0.0, 26.0, -28.0, 48.0],
+    [-56.0, 36.0, -82.0, 48.0],
+    [36.0, 36.0, -82.0, 48.0],
+    [110.0, 38.0, -44.0, 48.0],
+    [142.0, 13.0, 56.0, 48.0],
+    [-116.0, 13.0, 6.0, 48.0],
+    [14.0, 13.0, 96.0, 48.0],
+    [-14.0, 13.0, 96.0, 48.0],
+];
 
-    // Boats
-    for b in &world.boats {
-        let by = b.y + (t * 1.6 + b.phase).sin() * 0.06;
-        let (c, s) = (b.rot.cos(), b.rot.sin());
-        dyn_opaque.push(VoxelInstance::new(b.x, by, b.z, b.rot, 3.8, 0.45, 1.6, 0x9c5522, MAT_WOOD));
-        dyn_opaque.push(VoxelInstance::new(b.x + 2.1 * c, by + 0.12, b.z - 2.1 * s, b.rot, 0.7, 0.55, 1.1, 0x5c3012, MAT_WOOD));
-        dyn_opaque.push(VoxelInstance::new(b.x - 2.0 * c, by + 0.10, b.z + 2.0 * s, b.rot, 0.6, 0.52, 1.2, 0x5c3012, MAT_WOOD));
-        dyn_opaque.push(VoxelInstance::new(b.x + 2.15 * c, by + 0.55, b.z - 2.15 * s, b.rot, 0.32, 0.32, 0.32, col::LAMP_GLOW, MAT_LAMP));
-    }
+pub struct CameraPreset {
+    pub name: &'static str,
+    pub pos: Vec3,
+    pub target: Vec3,
+}
 
-    // 2-block-tall Kimono Villagers
-    let k_cols = [0x223b63u32, 0xa62626, 0xeeeae1];
-    let o_cols = [0xe6b800u32, 0x1e2024, 0xb81d13];
-    for v in &world.villagers {
-        let (mut px, mut pz, mut yaw) = (v.bx, v.bz, v.rot_y);
-        let py = if v.range > 0.0 {
-            let s = (t * v.speed + v.phase).sin();
-            let ds = (t * v.speed + v.phase).cos();
-            if v.axis_x { px += s * v.range; yaw = if ds >= 0.0 { 1.57 } else { -1.57 }; }
-            else { pz += s * v.range; yaw = if ds >= 0.0 { 0.0 } else { 3.14 }; }
-            v.by + (t * 6.0 + v.phase).sin().abs() * 0.06
-        } else {
-            v.by + (t * 2.0 + v.phase).sin() * 0.02
+pub const PRESETS: [CameraPreset; 9] = [
+    CameraPreset { name: "Overview", pos: Vec3::new(172.0, 108.0, 196.0), target: Vec3::new(0.0, 26.0, -12.0) },
+    CameraPreset { name: "Town & Doors", pos: Vec3::new(4.2, 13.6, 103.0), target: Vec3::new(16.0, 12.1, 94.0) },
+    CameraPreset { name: "Harbor & Boats", pos: Vec3::new(154.0, 14.5, 71.0), target: Vec3::new(137.0, 9.2, 55.0) },
+    CameraPreset { name: "Grand Bridge", pos: Vec3::new(42.0, 32.0, 66.0), target: Vec3::new(0.0, 14.0, 44.0) },
+    CameraPreset { name: "Watermill", pos: Vec3::new(-132.0, 20.0, 22.0), target: Vec3::new(-116.0, 11.8, 6.5) },
+    CameraPreset { name: "Cliff Temple", pos: Vec3::new(148.0, 44.0, -8.0), target: Vec3::new(118.0, 32.0, -46.0) },
+    CameraPreset { name: "Senbon Torii", pos: Vec3::new(-96.0, 34.0, -12.0), target: Vec3::new(-136.0, 25.0, -54.0) },
+    CameraPreset { name: "Zen Courtyard", pos: Vec3::new(20.0, 38.0, -14.0), target: Vec3::new(46.0, 26.0, -54.0) },
+    CameraPreset { name: "7-Tier Pagoda", pos: Vec3::new(-16.0, 62.0, -46.0), target: Vec3::new(-56.0, 52.0, -82.0) },
+];
+
+pub fn make_tour_curves() -> (CatmullRomCurve3, CatmullRomCurve3) {
+    let pos_curve = CatmullRomCurve3::new(
+        vec![
+            Vec3::new(172.0, 108.0, 196.0),
+            Vec3::new(24.0, 34.0, 186.0),
+            Vec3::new(4.0, 14.2, 104.0),
+            Vec3::new(0.0, 17.0, 74.0),
+            Vec3::new(18.0, 22.0, 54.0),
+            Vec3::new(154.0, 17.0, 72.0),
+            Vec3::new(148.0, 32.0, 14.0),
+            Vec3::new(132.0, 52.0, -20.0),
+            Vec3::new(58.0, 36.0, -34.0),
+            Vec3::new(16.0, 46.0, -50.0),
+            Vec3::new(-28.0, 56.0, -54.0),
+            Vec3::new(-105.0, 36.0, -24.0),
+            Vec3::new(-102.0, 20.0, 18.0),
+            Vec3::new(90.0, 96.0, 152.0),
+        ],
+        true,
+        0.45,
+    );
+    let look_curve = CatmullRomCurve3::new(
+        vec![
+            Vec3::new(0.0, 26.0, -12.0),
+            Vec3::new(0.0, 16.0, 132.0),
+            Vec3::new(16.0, 12.2, 94.0),
+            Vec3::new(0.0, 16.0, 44.0),
+            Vec3::new(0.0, 14.0, 44.0),
+            Vec3::new(136.0, 9.5, 56.0),
+            Vec3::new(132.0, 22.0, -40.0),
+            Vec3::new(110.0, 34.0, -44.0),
+            Vec3::new(48.0, 22.0, -40.0),
+            Vec3::new(36.0, 36.0, -82.0),
+            Vec3::new(-56.0, 48.0, -82.0),
+            Vec3::new(-138.0, 28.0, -62.0),
+            Vec3::new(-116.0, 12.0, 6.0),
+            Vec3::new(0.0, 26.0, -12.0),
+        ],
+        true,
+        0.45,
+    );
+    (pos_curve, look_curve)
+}
+
+#[derive(Copy, Clone)]
+pub struct DrawBatch {
+    pub idx_start: u32,
+    pub idx_count: u32,
+    pub base_vertex: i32,
+    pub inst_start: u32,
+    pub inst_count: u32,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum BuildingKey {
+    RyokanBlue,
+    RyokanRed,
+    MachiyaCream,
+    MachiyaDark,
+    Teahouse,
+    StallOrange,
+    StallBlue,
+    Watchtower,
+    Inari,
+}
+
+struct TownPlacement {
+    key: BuildingKey,
+    x: f32,
+    y: f32,
+    z: f32,
+    rot_y: f32,
+}
+
+struct BoatAnim {
+    base_x: f32,
+    base_y: f32,
+    base_z: f32,
+    base_rot: f32,
+    glide_range: f32,
+    phase: f32,
+    speed: f32,
+}
+
+#[derive(Copy, Clone)]
+enum WalkAxis {
+    None,
+    X,
+    Z,
+}
+
+struct VillagerAnim {
+    base_x: f32,
+    base_y: f32,
+    base_z: f32,
+    axis: WalkAxis,
+    range: f32,
+    rot_y: f32,
+    phase: f32,
+    speed: f32,
+}
+
+struct CloudCluster {
+    base_x: f32,
+    y: f32,
+    z: f32,
+    speed: f32,
+    offsets: Vec<[f32; 3]>,
+}
+
+struct FloatingLantern {
+    start_x: f32,
+    speed: f32,
+    phase: f32,
+}
+
+struct WfParticle {
+    is_upper: bool,
+    t0: f32,
+    ox: f32,
+    oz: f32,
+    speed: f32,
+    scale: f32,
+}
+
+#[derive(Copy, Clone)]
+struct MeshSpan {
+    idx_start: u32,
+    idx_count: u32,
+    base_vertex: i32,
+    tri_count: usize,
+}
+
+pub struct WorldScene {
+    pub vertices: Vec<VoxelVertex>,
+    pub indices: Vec<u32>,
+    pub static_instances: Vec<ModelInstance>,
+
+    pub opaque_shadow_batches: Vec<DrawBatch>,
+    pub water_batch: DrawBatch,
+    pub cloud_batch: DrawBatch,
+    pub mist_batch: DrawBatch,
+
+    pub dynamic_inst_start: u32,
+    pub dynamic_inst_count: u32,
+
+    pub total_voxels: u64,
+    pub total_tris: usize,
+    pub total_draws: usize,
+
+    boats_row: Vec<BoatAnim>,
+    boats_yaka: Vec<BoatAnim>,
+    villagers: [Vec<VillagerAnim>; 4],
+    clouds: Vec<CloudCluster>,
+    floating_lanterns: Vec<FloatingLantern>,
+    wf_particles: Vec<WfParticle>,
+}
+
+impl WorldScene {
+    pub fn build() -> Self {
+        let mut rng = Rng(20261113);
+        let mut colors = ColorCache::new();
+        let mut total_voxels = (GRID_N * GRID_N) as u64;
+
+        let mut grid = TerrainGrid::new();
+        let mut town_placements: Vec<TownPlacement> = Vec::new();
+
+        let mut plan_building = |grid: &mut TerrainGrid, key: BuildingKey, x: f32, z: f32, rot_y: f32, hw: f32, hd: f32, pad_y: f32| {
+            grid.register_pad(x, z, hw, hd, pad_y, true);
+            town_placements.push(TownPlacement { key, x, y: pad_y, z, rot_y });
         };
-        let kc = k_cols[v.color_idx % 3];
-        let oc = o_cols[v.color_idx % 3];
-        dyn_opaque.push(VoxelInstance::new(px, py + 0.09, pz, yaw, 0.68, 0.18, 0.45, 0x472d1c, MAT_WOOD));
-        dyn_opaque.push(VoxelInstance::new(px, py + 0.52, pz, yaw, 0.74, 0.68, 0.48, kc, MAT_MATTE));
-        dyn_opaque.push(VoxelInstance::new(px, py + 0.93, pz, yaw, 0.78, 0.16, 0.52, oc, MAT_MATTE));
-        dyn_opaque.push(VoxelInstance::new(px, py + 1.22, pz, yaw, 0.86, 0.44, 0.46, kc, MAT_MATTE));
-        dyn_opaque.push(VoxelInstance::new(px, py + 1.68, pz, yaw, 0.50, 0.48, 0.48, 0xf3cca4, MAT_MATTE));
-        dyn_opaque.push(VoxelInstance::new(px, py + 1.88, pz, yaw, 0.54, 0.18, 0.52, 0x1b1817, MAT_MATTE));
+
+        // Plan world layout
+        grid.register_pad(-56.0, -82.0, 14.0, 14.0, 28.0, true);
+        grid.register_pad(36.0, -82.0, 16.0, 12.0, 28.0, true);
+        grid.register_pad(-14.0, -76.0, 6.0, 6.0, 28.0, true);
+        grid.register_pad(10.0, -76.0, 6.0, 6.0, 28.0, true);
+        grid.register_pad(0.0, -28.0, 12.0, 6.0, 22.0, true);
+        grid.register_pad(-146.0, -88.0, 9.0, 9.0, 42.0, true);
+        grid.register_pad(-116.0, 10.0, 6.0, 6.0, 10.0, true);
+
+        plan_building(&mut grid, BuildingKey::RyokanBlue, -16.0, 94.0, FRAC_PI_2, 7.0, 6.0, 10.0);
+        plan_building(&mut grid, BuildingKey::RyokanRed, 16.0, 94.0, -FRAC_PI_2, 7.0, 6.0, 10.0);
+        plan_building(&mut grid, BuildingKey::RyokanRed, -16.0, 146.0, FRAC_PI_2, 7.0, 6.0, 10.0);
+        plan_building(&mut grid, BuildingKey::RyokanBlue, 16.0, 146.0, -FRAC_PI_2, 7.0, 6.0, 10.0);
+        plan_building(&mut grid, BuildingKey::Teahouse, -24.0, 118.0, FRAC_PI_2, 6.0, 6.0, 10.0);
+        plan_building(&mut grid, BuildingKey::Teahouse, 24.0, 118.0, -FRAC_PI_2, 6.0, 6.0, 10.0);
+        plan_building(&mut grid, BuildingKey::Watchtower, -12.0, 178.0, 0.0, 5.0, 5.0, 10.0);
+        plan_building(&mut grid, BuildingKey::Watchtower, 12.0, 178.0, 0.0, 5.0, 5.0, 10.0);
+
+        for (sx, sz, rot, k) in [
+            (-11.0, 110.0, FRAC_PI_2, BuildingKey::StallOrange),
+            (-11.0, 124.0, FRAC_PI_2, BuildingKey::StallBlue),
+            (11.0, 110.0, -FRAC_PI_2, BuildingKey::StallBlue),
+            (11.0, 124.0, -FRAC_PI_2, BuildingKey::StallOrange),
+            (-28.0, 102.0, 0.0, BuildingKey::StallOrange),
+            (28.0, 102.0, 0.0, BuildingKey::StallBlue),
+            (106.0, 66.0, FRAC_PI_2, BuildingKey::StallBlue),
+            (116.0, 74.0, PI, BuildingKey::StallOrange),
+        ] {
+            plan_building(&mut grid, k, sx, sz, rot, 4.0, 4.0, 10.0);
+        }
+
+        let machiya_keys = [
+            BuildingKey::MachiyaCream,
+            BuildingKey::MachiyaDark,
+            BuildingKey::Teahouse,
+            BuildingKey::RyokanBlue,
+            BuildingKey::RyokanRed,
+        ];
+        let mut add_street_row = |grid: &mut TerrainGrid, xs: &[f32], z: f32, rot: f32| {
+            for &bx in xs {
+                if is_water_body(bx, z) || bx.abs() < 22.0 {
+                    continue;
+                }
+                let idx = (rng.next_f32() * 3.6).floor() as usize;
+                let k = machiya_keys[idx.min(machiya_keys.len() - 1)];
+                plan_building(grid, k, bx, z, rot, 5.5, 5.5, 10.0);
+            }
+        };
+
+        add_street_row(&mut grid, &[-150.0, -138.0, -118.0, -104.0, -84.0, -70.0, -50.0, -38.0, 38.0, 50.0, 72.0, 86.0, 114.0], 70.0, 0.0);
+        add_street_row(&mut grid, &[-150.0, -138.0, -118.0, -104.0, -84.0, -70.0, -50.0, -38.0, 38.0, 50.0, 72.0, 86.0], 86.0, PI);
+        add_street_row(&mut grid, &[-148.0, -120.0, -106.0, -84.0, -70.0, -48.0, -38.0, 38.0, 48.0, 70.0], 98.0, 0.0);
+        add_street_row(&mut grid, &[-148.0, -120.0, -106.0, -84.0, -70.0, -48.0, -38.0, 38.0, 48.0, 70.0], 114.0, PI);
+        add_street_row(&mut grid, &[-148.0, -120.0, -106.0, -84.0, -70.0, -48.0, -38.0, 38.0, 48.0, 70.0], 132.0, 0.0);
+        add_street_row(&mut grid, &[-148.0, -120.0, -106.0, -84.0, -70.0, -48.0, -38.0, 38.0, 48.0, 70.0], 148.0, PI);
+        add_street_row(&mut grid, &[-122.0, -106.0, -84.0, -70.0, -48.0, -36.0, 36.0, 48.0, 70.0], 166.0, 0.0);
+        add_street_row(&mut grid, &[-106.0, -84.0, -48.0, -36.0, 36.0, 48.0], 184.0, PI);
+
+        plan_building(&mut grid, BuildingKey::Teahouse, -96.0, 28.0, 0.0, 5.5, 5.5, 10.0);
+        plan_building(&mut grid, BuildingKey::RyokanRed, -54.0, -4.0, 0.0, 6.5, 6.0, 10.0);
+        plan_building(&mut grid, BuildingKey::Teahouse, 42.0, -4.0, 0.0, 5.5, 5.5, 10.0);
+        plan_building(&mut grid, BuildingKey::MachiyaCream, 72.0, -4.0, 0.0, 5.5, 5.5, 10.0);
+
+        plan_building(&mut grid, BuildingKey::MachiyaDark, 114.0, 48.0, FRAC_PI_2, 5.5, 5.5, 10.0);
+        plan_building(&mut grid, BuildingKey::Watchtower, 120.0, 88.0, PI, 5.0, 5.0, 10.0);
+
+        town_placements.push(TownPlacement {
+            key: BuildingKey::Inari,
+            x: -146.0,
+            y: 42.0,
+            z: -88.0,
+            rot_y: PI * 0.15,
+        });
+
+        let senbon_curve = make_senbon_curve();
+        grid.generate(&senbon_curve);
+        grid.apply_pads_and_roads();
+        let (terrain_opaque, terrain_water) = grid.build_chunks(&mut colors);
+
+        let mut vertices: Vec<VoxelVertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut static_instances: Vec<ModelInstance> = Vec::new();
+        let mut opaque_shadow_batches: Vec<DrawBatch> = Vec::new();
+        let mut total_tris = 0usize;
+
+        let push_mesh = |vertices: &mut Vec<VoxelVertex>, indices: &mut Vec<u32>, mesh: &MeshData| -> MeshSpan {
+            let base_vertex = vertices.len() as i32;
+            let idx_start = indices.len() as u32;
+            let idx_count = mesh.indices.len() as u32;
+            vertices.extend_from_slice(&mesh.vertices);
+            indices.extend_from_slice(&mesh.indices);
+            MeshSpan {
+                idx_start,
+                idx_count,
+                base_vertex,
+                tri_count: mesh.tri_count(),
+            }
+        };
+
+        let mut add_static_batch = |span: MeshSpan, transforms: &[ModelInstance]| {
+            if span.idx_count == 0 || transforms.is_empty() {
+                return;
+            }
+            let inst_start = static_instances.len() as u32;
+            let inst_count = transforms.len() as u32;
+            static_instances.extend_from_slice(transforms);
+            opaque_shadow_batches.push(DrawBatch {
+                idx_start: span.idx_start,
+                idx_count: span.idx_count,
+                base_vertex: span.base_vertex,
+                inst_start,
+                inst_count,
+            });
+            total_tris += span.tri_count * transforms.len();
+        };
+
+        // 1. Terrain Opaque
+        let t_span = push_mesh(&mut vertices, &mut indices, &terrain_opaque);
+        add_static_batch(t_span, &[ModelInstance::identity()]);
+
+        // 2. Hero Landmarks
+        let (pagoda_m, c) = build_seven_tier_pagoda(&mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &pagoda_m);
+        add_static_batch(sp, &[ModelInstance::from_trs(Vec3::new(-56.0, 28.0, -82.0), 0.0, Vec3::ONE)]);
+
+        let (hall_m, c) = build_golden_hall(&mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &hall_m);
+        add_static_batch(sp, &[ModelInstance::from_trs(Vec3::new(36.0, 28.0, -82.0), 0.0, Vec3::ONE)]);
+
+        let (bell_m, c) = build_bell_tower(&mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &bell_m);
+        add_static_batch(
+            sp,
+            &[
+                ModelInstance::from_trs(Vec3::new(-14.0, 28.0, -76.0), 0.0, Vec3::ONE),
+                ModelInstance::from_trs(Vec3::new(10.0, 28.0, -76.0), 0.0, Vec3::ONE),
+            ],
+        );
+
+        let (gate_m, c) = build_nandaimon_gate(&mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &gate_m);
+        add_static_batch(sp, &[ModelInstance::from_trs(Vec3::new(0.0, 22.0, -28.0), 0.0, Vec3::ONE)]);
+
+        let (cliff_m, c) = build_cliff_stilt_temple(&mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &cliff_m);
+        add_static_batch(sp, &[ModelInstance::from_trs(Vec3::new(110.0, 34.0, -44.0), FRAC_PI_2, Vec3::ONE)]);
+
+        let (st_central, c) = build_ceremonial_staircase(20.0, 12.0, 6.0, &mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &st_central);
+        add_static_batch(sp, &[ModelInstance::from_trs(Vec3::new(0.0, 10.0, -14.0), 0.0, Vec3::ONE)]);
+
+        let (st_side, c) = build_ceremonial_staircase(16.0, 12.0, 3.0, &mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &st_side);
+        add_static_batch(
+            sp,
+            &[
+                ModelInstance::from_trs(Vec3::new(-68.0, 10.0, -16.0), 0.0, Vec3::ONE),
+                ModelInstance::from_trs(Vec3::new(68.0, 10.0, -16.0), 0.0, Vec3::ONE),
+            ],
+        );
+
+        let (st_upper, c) = build_ceremonial_staircase(10.0, 6.0, 5.0, &mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &st_upper);
+        add_static_batch(sp, &[ModelInstance::from_trs(Vec3::new(0.0, 22.0, -53.0), 0.0, Vec3::ONE)]);
+
+        let (taiko_m, c) = build_grand_taiko_bridge(&mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &taiko_m);
+        add_static_batch(
+            sp,
+            &[
+                ModelInstance::from_trs(Vec3::new(0.0, 10.0, 44.0), 0.0, Vec3::ONE),
+                ModelInstance::from_trs(Vec3::new(86.0, 10.0, river_z(86.0)), 0.0, Vec3::new(0.65, 0.65, 0.72)),
+            ],
+        );
+
+        let (cov_m, c) = build_covered_bridge(&mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &cov_m);
+        add_static_batch(
+            sp,
+            &[
+                ModelInstance::from_trs(Vec3::new(-58.0, 10.0, river_z(-58.0)), 0.0, Vec3::ONE),
+                ModelInstance::from_trs(Vec3::new(-116.0, 10.0, 11.0), 0.2, Vec3::new(0.75, 0.75, 0.62)),
+                ModelInstance::from_trs(Vec3::new(132.0, 10.0, 24.0), FRAC_PI_2, Vec3::new(0.68, 0.68, 0.58)),
+            ],
+        );
+
+        let (mill_m, wheel_m, c) = build_watermill_house(&mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &mill_m);
+        add_static_batch(sp, &[ModelInstance::from_trs(Vec3::new(-116.0, 10.0, 4.5), FRAC_PI_2, Vec3::ONE)]);
+        let wheel_span = push_mesh(&mut vertices, &mut indices, &wheel_m);
+
+        let (pier_m, c) = build_harbor_pier(&mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &pier_m);
+        add_static_batch(sp, &[ModelInstance::from_trs(Vec3::new(119.0, 9.6, 56.0), 0.0, Vec3::ONE)]);
+
+        let (deck_m, c) = build_island_deck(&mut colors);
+        total_voxels += c;
+        let sp = push_mesh(&mut vertices, &mut indices, &deck_m);
+        add_static_batch(sp, &[ModelInstance::from_trs(Vec3::new(-96.0, 9.8, 28.0), 0.0, Vec3::ONE)]);
+
+        // 3. Instanced Village Buildings
+        let b_arch = compile_building_archetypes(&mut colors);
+        total_voxels += b_arch.total_voxels;
+        let group_by_key = |k: BuildingKey| -> Vec<ModelInstance> {
+            town_placements
+                .iter()
+                .filter(|p| p.key == k)
+                .map(|p| ModelInstance::from_trs(Vec3::new(p.x, p.y, p.z), p.rot_y, Vec3::ONE))
+                .collect()
+        };
+        for (mesh, key) in [
+            (&b_arch.ryokan_blue, BuildingKey::RyokanBlue),
+            (&b_arch.ryokan_red, BuildingKey::RyokanRed),
+            (&b_arch.machiya_cream, BuildingKey::MachiyaCream),
+            (&b_arch.machiya_dark, BuildingKey::MachiyaDark),
+            (&b_arch.teahouse, BuildingKey::Teahouse),
+            (&b_arch.stall_orange, BuildingKey::StallOrange),
+            (&b_arch.stall_blue, BuildingKey::StallBlue),
+            (&b_arch.watchtower, BuildingKey::Watchtower),
+            (&b_arch.inari, BuildingKey::Inari),
+        ] {
+            let list = group_by_key(key);
+            if !list.is_empty() {
+                let sp = push_mesh(&mut vertices, &mut indices, mesh);
+                add_static_batch(sp, &list);
+            }
+        }
+
+        // Torii Gates
+        let grand_torii = vec![
+            ModelInstance::from_trs(Vec3::new(0.0, 10.0, 174.0), 0.0, Vec3::splat(1.15)),
+            ModelInstance::from_trs(Vec3::new(0.0, 10.0, 82.0), 0.0, Vec3::splat(1.05)),
+            ModelInstance::from_trs(Vec3::new(0.0, 10.0, 14.0), 0.0, Vec3::splat(1.05)),
+            ModelInstance::from_trs(Vec3::new(0.0, 22.0, -38.0), 0.0, Vec3::splat(0.95)),
+            ModelInstance::from_trs(Vec3::new(-38.0, 8.0, river_z(-38.0)), 0.0, Vec3::splat(1.2)),
+            ModelInstance::from_trs(Vec3::new(132.0, 8.0, -6.0), FRAC_PI_2, Vec3::splat(1.1)),
+        ];
+        let sp = push_mesh(&mut vertices, &mut indices, &b_arch.torii_grand);
+        add_static_batch(sp, &grand_torii);
+
+        let mut small_torii = Vec::with_capacity(42);
+        for i in 0..42 {
+            let t = 0.02 + (i as f32 / 41.0) * 0.94;
+            let pt = senbon_curve.get_point_at(t);
+            let tan = senbon_curve.get_tangent_at(t);
+            let sy = grid.get_surface_world_y(pt.x, pt.z);
+            small_torii.push(ModelInstance::from_trs(
+                Vec3::new(pt.x, sy, pt.z),
+                tan.x.atan2(tan.z),
+                Vec3::splat(0.92),
+            ));
+        }
+        let sp = push_mesh(&mut vertices, &mut indices, &b_arch.torii_small);
+        add_static_batch(sp, &small_torii);
+
+        // Stone Lanterns
+        let mut lanterns = Vec::new();
+        let mut z = 62.0f32;
+        while z <= 188.0 {
+            if (z - 118.0).abs() >= 12.0 {
+                lanterns.push(ModelInstance::from_trs(Vec3::new(-8.0, 10.0, z), 0.0, Vec3::ONE));
+                lanterns.push(ModelInstance::from_trs(Vec3::new(8.0, 10.0, z), 0.0, Vec3::ONE));
+            }
+            z += 18.0;
+        }
+        for x in [-90.0, -56.0, -24.0, 24.0, 56.0, 90.0] {
+            lanterns.push(ModelInstance::from_trs(Vec3::new(x, 10.0, 74.0), 0.0, Vec3::ONE));
+            lanterns.push(ModelInstance::from_trs(Vec3::new(x, 10.0, 136.0), 0.0, Vec3::ONE));
+        }
+        for (lx, ly, lz) in [
+            (-8.0, 10.0, 26.0), (8.0, 10.0, 26.0), (-8.0, 10.0, 0.0), (8.0, 10.0, 0.0),
+            (-28.0, 22.0, -32.0), (20.0, 22.0, -32.0), (78.0, 22.0, -32.0),
+            (-32.0, 28.0, -70.0), (-18.0, 28.0, -62.0), (18.0, 28.0, -62.0), (58.0, 28.0, -70.0),
+            (-74.0, 22.0, -38.0), (-38.0, 22.0, -38.0), (16.0, 22.0, -38.0),
+        ] {
+            lanterns.push(ModelInstance::from_trs(Vec3::new(lx, ly, lz), 0.0, Vec3::ONE));
+        }
+        let sp = push_mesh(&mut vertices, &mut indices, &b_arch.lantern);
+        add_static_batch(sp, &lanterns);
+
+        // 4. Flora
+        let tree_arch = compile_tree_archetypes(&mut rng, &mut colors);
+        total_voxels += tree_arch.total_voxels;
+        let mut sakura_buckets: [Vec<ModelInstance>; 4] = Default::default();
+        let mut pine_buckets: [Vec<ModelInstance>; 3] = Default::default();
+        let mut bamboo_list: Vec<ModelInstance> = Vec::new();
+        let mut rock_list = vec![
+            ModelInstance::from_trs(Vec3::new(38.0, 22.0, -41.0), 0.4, Vec3::splat(1.55)),
+            ModelInstance::from_trs(Vec3::new(60.0, 22.0, -38.0), 2.1, Vec3::splat(1.35)),
+            ModelInstance::from_trs(Vec3::new(48.0, 22.0, -46.0), 1.2, Vec3::splat(0.9)),
+        ];
+
+        let hero_sakuras: &[(f32, Option<f32>, f32, f32)] = &[
+            (-12.0, None, 162.0, 1.25), (12.0, None, 162.0, 1.25),
+            (-12.0, None, 130.0, 1.15), (12.0, None, 130.0, 1.15),
+            (-12.0, None, 74.0, 1.2), (12.0, None, 74.0, 1.2),
+            (-14.0, None, 24.0, 1.25), (14.0, None, 24.0, 1.25),
+            (-42.0, None, 42.0, 1.2), (42.0, None, 42.0, 1.2),
+            (-80.0, None, 44.0, 1.15), (96.0, None, 24.0, 1.25),
+            (158.0, None, 14.0, 1.3), (160.0, None, -14.0, 1.2), (108.0, None, 12.0, 1.15),
+            (-86.0, Some(28.0), -76.0, 1.15), (-32.0, Some(28.0), -94.0, 1.1),
+            (62.0, Some(28.0), -78.0, 1.2), (-84.0, Some(22.0), -48.0, 1.15),
+            (88.0, Some(22.0), -48.0, 1.1),
+        ];
+        for (i, &(sx, opt_y, sz, sc)) in hero_sakuras.iter().enumerate() {
+            let sy = match opt_y {
+                Some(y) => y,
+                None => {
+                    if is_water_body(sx, sz) {
+                        continue;
+                    }
+                    grid.get_surface_world_y(sx, sz)
+                }
+            };
+            sakura_buckets[i % 4].push(ModelInstance::from_trs(
+                Vec3::new(sx, sy, sz),
+                rng.next_f32() * TAU,
+                Vec3::splat(sc),
+            ));
+        }
+
+        let near_building = |x: f32, z: f32| -> bool {
+            town_placements.iter().any(|b| (x - b.x).hypot(z - b.z) < 10.5)
+        };
+
+        for i in 0..155 {
+            let x = (rng.next_f32() - 0.5) * 395.0;
+            let z = -95.0 + rng.next_f32() * 305.0;
+            if is_water_body(x, z) || near_building(x, z) {
+                continue;
+            }
+            if x.abs() < 15.0 && z > -106.0 {
+                continue;
+            }
+            if x.abs() <= 104.0 && (-106.0..=-22.0).contains(&z) {
+                continue;
+            }
+            if x >= 82.0 && z >= 88.0 {
+                continue;
+            }
+            if (z - 78.0).abs() < 9.0 || (z - 106.0).abs() < 9.0 || (z - 140.0).abs() < 9.0 || (z - 174.0).abs() < 9.0 {
+                continue;
+            }
+            let y = grid.get_surface_world_y(x, z);
+            if y > 38.0 {
+                continue;
+            }
+            if x < -118.0 && z < 16.0 {
+                let sc = 0.95 + rng.next_f32() * 0.45;
+                pine_buckets[i % 3].push(ModelInstance::from_trs(Vec3::new(x, y, z), rng.next_f32() * TAU, Vec3::splat(sc)));
+            } else {
+                let sc = 0.9 + rng.next_f32() * 0.45;
+                sakura_buckets[i % 4].push(ModelInstance::from_trs(Vec3::new(x, y, z), rng.next_f32() * TAU, Vec3::splat(sc)));
+            }
+        }
+
+        for i in 0..140 {
+            let side = if rng.next_f32() < 0.5 { -1.0 } else { 1.0 };
+            let x = side * (112.0 + rng.next_f32() * 98.0);
+            let z = -135.0 + rng.next_f32() * 155.0;
+            if is_water_body(x, z) || near_building(x, z) || (x > 105.0 && x < 154.0 && z < -22.0) {
+                continue;
+            }
+            let y = grid.get_surface_world_y(x, z);
+            if (10.0..=46.0).contains(&y) {
+                let sc = 0.95 + rng.next_f32() * 0.5;
+                pine_buckets[i % 3].push(ModelInstance::from_trs(Vec3::new(x, y, z), rng.next_f32() * TAU, Vec3::splat(sc)));
+            }
+        }
+
+        for _ in 0..160 {
+            let x = -195.0 + rng.next_f32() * 82.0;
+            let z = -98.0 + rng.next_f32() * 116.0;
+            if is_water_body(x, z) || near_building(x, z) {
+                continue;
+            }
+            let y = grid.get_surface_world_y(x, z);
+            if y <= 40.0 {
+                let sc = 0.85 + rng.next_f32() * 0.45;
+                bamboo_list.push(ModelInstance::from_trs(Vec3::new(x, y, z), rng.next_f32() * TAU, Vec3::splat(sc)));
+            }
+        }
+
+        for _ in 0..55 {
+            let ang = rng.next_f32() * TAU;
+            let r = 23.0 + rng.next_f32() * 8.0;
+            let x = 132.0 + ang.cos() * r;
+            let z = -6.0 + ang.sin() * r;
+            if !is_water_body(x, z) {
+                let y = grid.get_surface_world_y(x, z);
+                let sc = 0.8 + rng.next_f32() * 0.8;
+                rock_list.push(ModelInstance::from_trs(Vec3::new(x, y, z), rng.next_f32() * TAU, Vec3::splat(sc)));
+            }
+        }
+
+        for (i, list) in sakura_buckets.iter().enumerate() {
+            let sp = push_mesh(&mut vertices, &mut indices, &tree_arch.sakuras[i]);
+            add_static_batch(sp, list);
+        }
+        for (i, list) in pine_buckets.iter().enumerate() {
+            let sp = push_mesh(&mut vertices, &mut indices, &tree_arch.pines[i]);
+            add_static_batch(sp, list);
+        }
+        let sp = push_mesh(&mut vertices, &mut indices, &tree_arch.bamboo);
+        add_static_batch(sp, &bamboo_list);
+        let sp = push_mesh(&mut vertices, &mut indices, &tree_arch.rock);
+        add_static_batch(sp, &rock_list);
+
+        // Static translucent Water batch
+        let w_span = push_mesh(&mut vertices, &mut indices, &terrain_water);
+        let water_inst_start = static_instances.len() as u32;
+        static_instances.push(ModelInstance::identity());
+        let water_batch = DrawBatch {
+            idx_start: w_span.idx_start,
+            idx_count: w_span.idx_count,
+            base_vertex: w_span.base_vertex,
+            inst_start: water_inst_start,
+            inst_count: 1,
+        };
+        total_tris += w_span.tri_count;
+
+        // 5. Dynamic Entities Setup (append dynamic meshes, reserve contiguous dynamic instance range)
+        let boat_arch = build_boat_archetypes(&mut colors);
+        total_voxels += boat_arch.total_voxels;
+        let row_span = push_mesh(&mut vertices, &mut indices, &boat_arch.rowboat);
+        let yaka_span = push_mesh(&mut vertices, &mut indices, &boat_arch.yakatabune);
+
+        let (villager_meshes, vc) = build_villager_archetypes(&mut colors);
+        total_voxels += vc;
+        let villager_spans = [
+            push_mesh(&mut vertices, &mut indices, &villager_meshes[0]),
+            push_mesh(&mut vertices, &mut indices, &villager_meshes[1]),
+            push_mesh(&mut vertices, &mut indices, &villager_meshes[2]),
+            push_mesh(&mut vertices, &mut indices, &villager_meshes[3]),
+        ];
+
+        let fl_mesh = build_unit_box_mesh(0.45, 0.45, 0.45, MAT_LAMP as u32, pal::LAMP_GLOW, &mut colors);
+        let fl_span = push_mesh(&mut vertices, &mut indices, &fl_mesh);
+
+        let cloud_mesh = build_unit_box_mesh(5.5, 3.2, 5.5, MAT_CLOUD as u32, 0xf4f8fc, &mut colors);
+        let cloud_span = push_mesh(&mut vertices, &mut indices, &cloud_mesh);
+
+        let mist_mesh = build_unit_box_mesh(0.45, 0.45, 0.45, MAT_MIST as u32, 0xeafafc, &mut colors);
+        let mist_span = push_mesh(&mut vertices, &mut indices, &mist_mesh);
+
+        // Boats
+        let mut boats_row = Vec::new();
+        let mut boats_yaka = Vec::new();
+        let mut spawn_boat = |is_yaka: bool, x: f32, z: f32, rot_y: f32, glide_range: f32| {
+            let b = BoatAnim {
+                base_x: x,
+                base_y: 8.0,
+                base_z: z,
+                base_rot: rot_y,
+                glide_range,
+                phase: rng.next_f32() * TAU,
+                speed: 0.16 + rng.next_f32() * 0.1,
+            };
+            if is_yaka {
+                boats_yaka.push(b);
+            } else {
+                boats_row.push(b);
+            }
+        };
+        spawn_boat(true, 140.0, 52.0, -0.35, 0.0);
+        spawn_boat(true, 150.0, 66.0, 0.28, 0.0);
+        spawn_boat(false, 136.0, 61.0, 0.4, 0.0);
+        spawn_boat(false, 146.0, 46.0, -0.5, 0.0);
+        spawn_boat(false, 156.0, 56.0, 1.1, 0.0);
+        spawn_boat(false, 124.0, -10.0, 0.55, 0.0);
+        spawn_boat(true, 142.0, -2.0, -0.8, 0.0);
+        spawn_boat(false, -100.0, 14.0, -0.25, 0.0);
+        spawn_boat(true, -28.0, river_z(-28.0), 0.0, 14.0);
+        spawn_boat(false, 32.0, river_z(32.0), 0.0, 22.0);
+        spawn_boat(false, -84.0, river_z(-84.0), 0.0, 18.0);
+        spawn_boat(false, 64.0, river_z(64.0), 0.0, 12.0);
+
+        // Villagers
+        let mut villagers: [Vec<VillagerAnim>; 4] = Default::default();
+        let mut spawn_villager = |x: f32, y: f32, z: f32, arch: usize, axis: WalkAxis, range: f32, rot_y: f32, phase: f32, speed: f32| {
+            let a = arch % 4;
+            villagers[a].push(VillagerAnim {
+                base_x: x,
+                base_y: y,
+                base_z: z,
+                axis,
+                range,
+                rot_y,
+                phase,
+                speed,
+            });
+        };
+        let p0 = rng.next_f32() * TAU; let s0 = 0.48 + rng.next_f32() * 0.36;
+        spawn_villager(-1.5, 14.5, 44.0, 1, WalkAxis::Z, 5.5, 0.0, p0, s0);
+        let p0 = rng.next_f32() * TAU; let s0 = 0.48 + rng.next_f32() * 0.36;
+        spawn_villager(1.8, 14.5, 42.0, 0, WalkAxis::Z, 4.5, PI, p0, s0);
+        let p0 = rng.next_f32() * TAU; let s0 = 0.48 + rng.next_f32() * 0.36;
+        spawn_villager(0.2, 14.5, 46.0, 2, WalkAxis::None, 0.0, 0.4, p0, s0);
+        let p0 = rng.next_f32() * TAU; let s0 = 0.48 + rng.next_f32() * 0.36;
+        spawn_villager(-58.0, 12.6, river_z(-58.0), 3, WalkAxis::Z, 4.5, 0.0, p0, s0);
+
+        let town_spots = [
+            (9.5, 95.0, 1, WalkAxis::Z, 5.0), (11.5, 102.0, 2, WalkAxis::Z, 4.0), (-9.5, 96.0, 0, WalkAxis::Z, 5.5),
+            (-3.5, 118.0, 3, WalkAxis::X, 6.5), (4.5, 114.0, 1, WalkAxis::X, 5.5), (-16.0, 118.0, 2, WalkAxis::None, 0.0), (16.0, 120.0, 0, WalkAxis::None, 0.0),
+            (-2.0, 152.0, 0, WalkAxis::Z, 8.0), (2.5, 168.0, 3, WalkAxis::Z, 7.0), (0.5, 74.0, 1, WalkAxis::Z, 6.0),
+            (-45.0, 78.0, 2, WalkAxis::X, 12.0), (-78.0, 78.0, 0, WalkAxis::X, 10.0), (-112.0, 78.0, 3, WalkAxis::X, 9.0),
+            (44.0, 78.0, 1, WalkAxis::X, 12.0), (78.0, 78.0, 2, WalkAxis::X, 9.0), (-44.0, 106.0, 0, WalkAxis::X, 10.0),
+            (44.0, 106.0, 3, WalkAxis::X, 10.0), (-62.0, 140.0, 1, WalkAxis::X, 11.0), (54.0, 140.0, 2, WalkAxis::X, 11.0),
+            (-106.0, 140.0, 0, WalkAxis::X, 9.0), (108.0, 62.0, 3, WalkAxis::Z, 5.0), (122.0, 56.0, 0, WalkAxis::X, 4.0),
+        ];
+        for (vx, vz, arch, ax, rg) in town_spots {
+            let vy = grid.get_surface_world_y(vx, vz);
+            let rot = rng.next_f32() * TAU;
+            let ph = rng.next_f32() * TAU;
+            let sp = 0.48 + rng.next_f32() * 0.36;
+            spawn_villager(vx, vy, vz, arch, ax, rg, rot, ph, sp);
+        }
+        for (vx, vy, vz, arch, ax, rg) in [
+            (-12.0, 22.0, -40.0, 0, WalkAxis::X, 8.0), (14.0, 22.0, -40.0, 2, WalkAxis::X, 8.0),
+            (34.0, 22.0, -32.0, 3, WalkAxis::None, 0.0), (56.0, 22.0, -48.0, 0, WalkAxis::None, 0.0),
+            (-44.0, 28.0, -80.0, 1, WalkAxis::X, 6.0), (-24.0, 28.0, -80.0, 2, WalkAxis::X, 8.0),
+            (24.0, 28.0, -68.0, 0, WalkAxis::X, 7.0), (36.0, 28.0, -64.0, 3, WalkAxis::None, 0.0),
+            (110.0, 34.0, -36.0, 1, WalkAxis::None, 0.0), (-146.0, 42.0, -80.0, 2, WalkAxis::None, 0.0),
+            (-96.0, 10.1, 31.0, 1, WalkAxis::None, 0.0),
+        ] {
+            let rot = rng.next_f32() * TAU;
+            let ph = rng.next_f32() * TAU;
+            let sp = 0.48 + rng.next_f32() * 0.36;
+            spawn_villager(vx, vy, vz, arch, ax, rg, rot, ph, sp);
+        }
+
+        // Clouds
+        let mut clouds = Vec::with_capacity(26);
+        let mut total_cloud_blocks = 0usize;
+        for _ in 0..26 {
+            let lx = 3 + (rng.next_f32() * 5.0).floor() as i32;
+            let lz = 2 + (rng.next_f32() * 4.0).floor() as i32;
+            let mut offsets = Vec::new();
+            for dx in -lx..=lx {
+                for dz in -lz..=lz {
+                    let d = (dx * dx) as f32 / (lx * lx) as f32 + 0.0001;
+                    let d2 = (dx * dx) as f32 / ((lx * lx) as f32 + 0.5) + (dz * dz) as f32 / ((lz * lz) as f32 + 0.5);
+                    let _ = d;
+                    if d2 <= 1.0 {
+                        offsets.push([dx as f32 * 4.8, 0.0, dz as f32 * 4.8]);
+                        if d2 < 0.45 && rng.next_f32() < 0.78 {
+                            offsets.push([dx as f32 * 4.8, 2.8, dz as f32 * 4.8]);
+                        }
+                    }
+                }
+            }
+            total_cloud_blocks += offsets.len();
+            clouds.push(CloudCluster {
+                base_x: (rng.next_f32() - 0.5) * 560.0,
+                y: 128.0 + rng.next_f32() * 34.0,
+                z: (rng.next_f32() - 0.5) * 480.0,
+                speed: 1.8 + rng.next_f32() * 1.6,
+                offsets,
+            });
+        }
+
+        // Floating River Paper Lanterns (48)
+        let mut floating_lanterns = Vec::with_capacity(48);
+        for _ in 0..48 {
+            let x = -165.0 + rng.next_f32() * 320.0;
+            let _z = river_z(x) + (rng.next_f32() - 0.5) * 7.5;
+            floating_lanterns.push(FloatingLantern {
+                start_x: x,
+                speed: 1.1 + rng.next_f32() * 0.7,
+                phase: rng.next_f32() * TAU,
+            });
+        }
+
+        // Waterfall Mist Particles (320)
+        let mut wf_particles = Vec::with_capacity(320);
+        for i in 0..320 {
+            let is_upper = (i as f32) < 320.0 * 0.45;
+            wf_particles.push(WfParticle {
+                is_upper,
+                t0: rng.next_f32(),
+                ox: (rng.next_f32() - 0.5) * 8.5,
+                oz: (rng.next_f32() - 0.5) * 4.5,
+                speed: 0.5 + rng.next_f32() * 0.45,
+                scale: 0.6 + rng.next_f32() * 1.1,
+            });
+        }
+
+        // Register dynamic batch offsets right after static_instances
+        let dynamic_inst_start = static_instances.len() as u32;
+        let mut cur_inst = dynamic_inst_start;
+
+        let mut push_dyn_batch = |span: MeshSpan, count: usize| -> DrawBatch {
+            let b = DrawBatch {
+                idx_start: span.idx_start,
+                idx_count: span.idx_count,
+                base_vertex: span.base_vertex,
+                inst_start: cur_inst,
+                inst_count: count as u32,
+            };
+            cur_inst += count as u32;
+            total_tris += span.tri_count * count;
+            b
+        };
+
+        // Dynamic shadow-casting opaque batches:
+        let wheel_batch = push_dyn_batch(wheel_span, 1);
+        opaque_shadow_batches.push(wheel_batch);
+
+        let row_batch = push_dyn_batch(row_span, boats_row.len());
+        opaque_shadow_batches.push(row_batch);
+
+        let yaka_batch = push_dyn_batch(yaka_span, boats_yaka.len());
+        opaque_shadow_batches.push(yaka_batch);
+
+        for i in 0..4 {
+            let vb = push_dyn_batch(villager_spans[i], villagers[i].len());
+            opaque_shadow_batches.push(vb);
+        }
+
+        let fl_batch = push_dyn_batch(fl_span, floating_lanterns.len());
+        opaque_shadow_batches.push(fl_batch);
+
+        // Dynamic translucent non-shadow batches:
+        let cloud_batch = push_dyn_batch(cloud_span, total_cloud_blocks);
+        let mist_batch = push_dyn_batch(mist_span, wf_particles.len());
+
+        let dynamic_inst_count = cur_inst - dynamic_inst_start;
+        let total_draws = opaque_shadow_batches.len() + 3; // + water + clouds + mist
+
+        Self {
+            vertices,
+            indices,
+            static_instances,
+            opaque_shadow_batches,
+            water_batch,
+            cloud_batch,
+            mist_batch,
+            dynamic_inst_start,
+            dynamic_inst_count,
+            total_voxels,
+            total_tris,
+            total_draws,
+            boats_row,
+            boats_yaka,
+            villagers,
+            clouds,
+            floating_lanterns,
+            wf_particles,
+        }
     }
 
-    // Drifting Volumetric Clouds
-    for c in &mut world.clouds {
-        c.x += c.speed * dt;
-        if c.x > 195.0 { c.x = -195.0; }
-        for &[ox, oy, oz] in &c.offsets {
-            dyn_trans.push(VoxelInstance::new(c.x + ox, c.y + oy, c.z + oz, 0.0, 3.4, 2.2, 3.4, 0xf0f4f8, MAT_MATTE));
+    pub fn update_dynamic_instances(&self, t: f32, out: &mut Vec<ModelInstance>) {
+        out.clear();
+        out.reserve(self.dynamic_inst_count as usize);
+
+        // 1. Watermill Wheel: parent (-116, 10, 4.5) rotY = PI/2, child local (-4.0, 1.3, 0) rotX = -t * 0.9
+        let mill_mat = Mat4::from_translation(Vec3::new(-116.0, 10.0, 4.5))
+            * Mat4::from_rotation_y(FRAC_PI_2)
+            * Mat4::from_translation(Vec3::new(-4.0, 1.3, 0.0))
+            * Mat4::from_rotation_x(-t * 0.9);
+        out.push(ModelInstance::from_mat4(mill_mat));
+
+        // 2. Boats (Rowboats, then Yakatabune)
+        let push_boats = |boats: &[BoatAnim], out: &mut Vec<ModelInstance>| {
+            for b in boats {
+                let y = b.base_y + (t * 1.65 + b.phase).sin() * 0.07;
+                let roll = (t * 1.3 + b.phase).sin() * 0.032;
+                let (x, z, yaw) = if b.glide_range > 0.0 {
+                    let s = (t * b.speed + b.phase).sin();
+                    let ds = (t * b.speed + b.phase).cos();
+                    let nx = b.base_x + s * b.glide_range;
+                    let nz = river_z(nx);
+                    let dzdx = river_z(nx + 0.5) - river_z(nx - 0.5);
+                    let yaw = (-dzdx).atan2(1.0) + if ds >= 0.0 { 0.0 } else { PI };
+                    (nx, nz, yaw)
+                } else {
+                    (b.base_x, b.base_z, b.base_rot)
+                };
+                let m = Mat4::from_translation(Vec3::new(x, y, z))
+                    * Mat4::from_rotation_y(yaw)
+                    * Mat4::from_rotation_z(roll);
+                out.push(ModelInstance::from_mat4(m));
+            }
+        };
+        push_boats(&self.boats_row, out);
+        push_boats(&self.boats_yaka, out);
+
+        // 3. Villagers (4 archetypes)
+        for group in &self.villagers {
+            for v in group {
+                let (x, y, z, yaw) = match v.axis {
+                    WalkAxis::Z if v.range > 0.0 => {
+                        let s = (t * v.speed + v.phase).sin();
+                        let ds = (t * v.speed + v.phase).cos();
+                        let py = v.base_y + (t * 6.5 + v.phase).sin().abs() * 0.06;
+                        (v.base_x, py, v.base_z + s * v.range, if ds >= 0.0 { 0.0 } else { PI })
+                    }
+                    WalkAxis::X if v.range > 0.0 => {
+                        let s = (t * v.speed + v.phase).sin();
+                        let ds = (t * v.speed + v.phase).cos();
+                        let py = v.base_y + (t * 6.5 + v.phase).sin().abs() * 0.06;
+                        (v.base_x + s * v.range, py, v.base_z, if ds >= 0.0 { FRAC_PI_2 } else { -FRAC_PI_2 })
+                    }
+                    _ => {
+                        let py = v.base_y + (t * 2.0 + v.phase).sin() * 0.02;
+                        (v.base_x, py, v.base_z, v.rot_y)
+                    }
+                };
+                out.push(ModelInstance::from_trs(Vec3::new(x, y, z), yaw, Vec3::ONE));
+            }
         }
+
+        // 4. Floating River Lanterns
+        for fl in &self.floating_lanterns {
+            let fx = (fl.start_x + t * fl.speed + 165.0).rem_euclid(330.0) - 165.0;
+            let fz = river_z(fx) + (t * 0.5 + fl.phase).sin() * 2.5;
+            let fy = 8.15 + (t * 2.5 + fl.phase).sin() * 0.04;
+            out.push(ModelInstance::from_trs(
+                Vec3::new(fx, fy, fz),
+                t * 0.4 + fl.phase,
+                Vec3::ONE,
+            ));
+        }
+
+        // 5. Clouds
+        for c in &self.clouds {
+            let cx = (c.base_x + t * c.speed + 290.0).rem_euclid(580.0) - 290.0;
+            for &[ox, oy, oz] in &c.offsets {
+                out.push(ModelInstance::from_trs(
+                    Vec3::new(cx + ox, c.y + oy, c.z + oz),
+                    0.0,
+                    Vec3::ONE,
+                ));
+            }
+        }
+
+        // 6. Waterfall Mist & Spray Particles
+        for w in &self.wf_particles {
+            let wt = (w.t0 + t * w.speed).fract();
+            let (py, pz) = if w.is_upper {
+                let pz = -84.0 + wt * 20.0;
+                let py = 64.0 - wt * 28.0 + (wt * PI).sin() * 1.4;
+                (py, pz)
+            } else {
+                let pz = -48.0 + wt * 20.0;
+                let py = 36.0 - wt * 27.5 + if wt > 0.85 { (wt - 0.85) * 18.0 } else { 0.0 };
+                (py, pz)
+            };
+            let px = 132.0 + 2.5 * (pz * 0.14).sin() + w.ox * (0.4 + wt * 0.8);
+            let puff = w.scale * (0.6 + if wt > 0.82 { (wt - 0.82) * 8.0 } else { 0.0 });
+            let z_off = w.oz * if wt > 0.8 { 1.5 } else { 0.4 };
+            out.push(ModelInstance::from_trs(
+                Vec3::new(px, py, pz + z_off),
+                0.0,
+                Vec3::splat(puff),
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_scene_and_dynamic_batches_are_consistent() {
+        let scene = WorldScene::build();
+        assert!(scene.total_voxels > 1_000_000);
+        assert!(scene.total_tris > 1_000_000);
+        assert!(!scene.vertices.is_empty());
+        assert!(!scene.indices.is_empty());
+        assert_eq!(scene.indices.len() % 3, 0);
+        assert_eq!(scene.static_instances.len() as u32, scene.dynamic_inst_start);
+
+        let total_inst = scene.dynamic_inst_start + scene.dynamic_inst_count;
+        for b in scene
+            .opaque_shadow_batches
+            .iter()
+            .chain([&scene.water_batch, &scene.cloud_batch, &scene.mist_batch])
+        {
+            assert!((b.idx_start + b.idx_count) as usize <= scene.indices.len());
+            assert!(b.base_vertex >= 0);
+            assert!(b.inst_start + b.inst_count <= total_inst);
+        }
+
+        let mut dyn_buf = Vec::new();
+        scene.update_dynamic_instances(12.5, &mut dyn_buf);
+        assert_eq!(dyn_buf.len(), scene.dynamic_inst_count as usize);
+
+        let (pos_curve, look_curve) = make_tour_curves();
+        for t in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            assert!(pos_curve.get_point_at(t).is_finite());
+            assert!(look_curve.get_point_at(t).is_finite());
+        }
+
+        for tod in [TimeOfDay::Day, TimeOfDay::Sunset, TimeOfDay::Night] {
+            let p = tod.params();
+            assert!(p.sun_int > 0.0 && p.exposure > 0.0);
+        }
+        assert_eq!(PRESETS.len(), 9);
     }
 }
