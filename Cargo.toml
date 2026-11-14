@@ -1,0 +1,11 @@
+[package]
+name = "sakura-temple-wgpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "30.0"
+winit = "0.30"
+glam = { version = "0.33", features = ["bytemuck"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+pollster = "1.0"

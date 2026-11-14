@@ -1,0 +1,18 @@
+# Build artifacts
+/target/
+
+# Chat-update scratch files (superseded copies of src/)
+updated.txt
+
+# Secrets & env
+.env
+.env.*
+*.key
+*.pem
+*.secret
+*.enc
+
+# Logs & temp
+*.log
+*.tmp
+*.cache
